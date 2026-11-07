@@ -23,6 +23,14 @@
       "/usr/local/bin/yt-dlp"
     ]
   },
+  "settings": [
+    {
+      "key": "spDc",
+      "label": "sp_dc cookie",
+      "help": "Sign in at open.spotify.com in your browser, then copy the sp_dc cookie from its developer tools (Storage > Cookies). Needed on Linux, optional elsewhere.",
+      "link": "https://open.spotify.com"
+    }
+  ],
   "navigation": [
     {
       "builtin": "home"

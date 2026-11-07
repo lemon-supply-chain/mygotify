@@ -385,13 +385,19 @@ function toAlbum(raw) {
   };
 }
 
+// A track wrapped as {_uri, data}, as liked songs and the home page give it,
+// may have its URI only on the wrapper.
+const unwrap = (w) => (w?.data ? { uri: w._uri, ...w.data } : null);
+
 function toTrack(raw, fallbackAlbum = null) {
   if (!raw) return { id: "", name: "", album: { id: "", name: "" }, duration: 0 };
   const id = raw.uri ? raw.uri.replace(/^spotify:track:/, "") : raw.id || "";
   const name = raw.name || "";
   const artists = (raw.artists?.items || raw.firstArtist?.items || []).map(toArtist);
   const album = raw.albumOfTrack ? toAlbum(raw.albumOfTrack) : fallbackAlbum || { id: "", name: "" };
-  const duration = raw.duration?.totalMilliseconds || 0;
+  // Playlists, and so the home page and radio, name it trackDuration. Without
+  // it the app can't seek, as the MP3 it's served is live and has no length.
+  const duration = raw.duration?.totalMilliseconds || raw.trackDuration?.totalMilliseconds || 0;
   const url = raw.sharingInfo?.shareUrl || (id ? `https://open.spotify.com/track/${id}` : "");
   const unavailable = raw.playability?.playable === false ? true : undefined;
   return {
@@ -428,13 +434,30 @@ function toPlaylist(raw, tracks = []) {
 // Plugin Exports: Authentication & User Account
 // ============================================================================
 
+// The sp_dc cookie pasted in the settings, as its value or as "sp_dc=…".
+function pastedSpDc() {
+  const pasted = (host.setting("spDc") || "").trim();
+  return pasted.includes("=") ? cookieValue(pasted, "sp_dc") : pasted;
+}
+
+// Signing in takes the cookie from the settings when one is pasted there.
+// Otherwise it's Spotify's page in a window of the app, except on Linux, where
+// opening that window from a plugin aborts the app (WebKitGTK binds its UI
+// thread to whichever thread first uses it), so the settings are the only way.
 export async function signIn() {
-  const { cookie: cookieHeader } = await host.webSignIn({
-    url: "https://accounts.spotify.com/en/login",
-    cookiesOf: "https://open.spotify.com",
-    until: ["sp_dc"],
-  });
-  const spDc = cookieValue(cookieHeader, "sp_dc");
+  let spDc = pastedSpDc();
+  let cookieHeader = spDc ? `sp_dc=${spDc}` : "";
+  if (!spDc) {
+    if (host.platform === "linux") {
+      throw fail("setup", t("Paste your sp_dc cookie in the settings to sign in"));
+    }
+    ({ cookie: cookieHeader } = await host.webSignIn({
+      url: "https://accounts.spotify.com/en/login",
+      cookiesOf: "https://open.spotify.com",
+      until: ["sp_dc"],
+    }));
+    spDc = cookieValue(cookieHeader, "sp_dc");
+  }
   if (!spDc) {
     throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
   }
@@ -442,11 +465,18 @@ export async function signIn() {
   host.storage.set("cookie", cookieHeader);
   tokenInfo = null;
   host.storage.remove("token");
-  const acc = await account();
+  const acc = await account().catch(() => null);
   if (!acc) {
+    signOut();
     throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
   }
   return acc;
+}
+
+// A new cookie in the settings ends the session made with the old one: signing
+// in again takes the new one.
+export function setSetting({ key }) {
+  if (key === "spDc") signOut();
 }
 
 export function signOut() {
@@ -478,6 +508,32 @@ export async function account() {
 // Plugin Exports: Home & Browse
 // ============================================================================
 
+// The home page's tracks come without their length, which the app needs to
+// seek in the live MP3 they're played as. Each is asked for a few at a time,
+// and kept, as a track's length doesn't change. api.spotify.com's batch of
+// tracks would be one request, but it turns the web player's token away.
+async function fillDurations(tracks) {
+  const known = host.storage.get("durations") || {};
+  const missing = tracks.filter((tr) => !tr.duration && !known[tr.id] && tr.id);
+  for (let i = 0; i < missing.length; i += 5) {
+    await Promise.all(
+      missing.slice(i, i + 5).map(async (tr) => {
+        try {
+          const res = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
+            uri: `spotify:track:${tr.id}`,
+          });
+          const ms = res?.data?.trackUnion?.duration?.totalMilliseconds;
+          if (ms) known[tr.id] = ms;
+        } catch (e) {
+          console.warn(`length of ${tr.id}: ${e.message}`);
+        }
+      })
+    );
+  }
+  if (missing.length) host.storage.set("durations", known);
+  for (const tr of tracks) tr.duration = tr.duration || known[tr.id] || 0;
+}
+
 export async function home() {
   const spT = cookieValue(host.storage.get("cookie") || "", "sp_t");
   const res = await gql("home", "3357ffed7961629ba92b4e0a41514e4d5004a14355c964c23ce442205c9e44a1", {
@@ -504,7 +560,7 @@ export async function home() {
       if (!c || !c.data) continue;
       switch (c.__typename) {
         case "TrackResponseWrapper":
-          sec.tracks.push(toTrack(c.data));
+          sec.tracks.push(toTrack(unwrap(c)));
           break;
         case "AlbumResponseWrapper":
           sec.albums.push(toAlbum(c.data));
@@ -521,6 +577,7 @@ export async function home() {
       sections.push(sec);
     }
   }
+  await fillDurations(sections.flatMap((s) => s.tracks || []));
   return { title: t("Home"), sections };
 }
 
@@ -547,7 +604,7 @@ export async function browse({ page }) {
     if (!c || !c.data) continue;
     switch (c.__typename) {
       case "TrackResponseWrapper":
-        sec.tracks.push(toTrack(c.data));
+        sec.tracks.push(toTrack(unwrap(c)));
         break;
       case "AlbumResponseWrapper":
         sec.albums.push(toAlbum(c.data));
@@ -560,6 +617,7 @@ export async function browse({ page }) {
         break;
     }
   }
+  await fillDurations(sec.tracks);
   return { title, sections: [sec] };
 }
 
@@ -732,7 +790,7 @@ export async function liked({ offset = 0 }) {
   const lib = res?.data?.me?.library?.tracks;
   if (!lib) return { tracks: [], more: false };
   const items = lib.items || [];
-  const tracks = items.map((item) => toTrack(item.track?.data));
+  const tracks = items.map((item) => toTrack(unwrap(item.track)));
   const total = lib.totalCount || 0;
   return { tracks, more: offset + tracks.length < total };
 }
