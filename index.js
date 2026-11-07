@@ -419,12 +419,13 @@ function toArtist(raw) {
   };
 }
 
-function toAlbum(raw) {
+function toAlbum(raw, fallbackArtists = []) {
   if (!raw) return { id: "", name: "" };
   const id = raw.uri ? raw.uri.replace(/^spotify:album:/, "") : raw.id || "";
   const name = raw.name || "";
   const imageUrl = imageOf(raw.coverArt || raw.images);
-  const artists = (raw.artists?.items || []).map(toArtist);
+  const rawArtists = (raw.artists?.items || []).map(toArtist);
+  const artists = rawArtists.length > 0 ? rawArtists : fallbackArtists;
   const released = raw.date?.isoString || (raw.date?.year ? String(raw.date.year) : "");
   return {
     id,
@@ -844,6 +845,50 @@ export async function album({ id }) {
   return { album: a, tracks };
 }
 
+async function fetchDiscographyGroup(opName, groupName, artistUri) {
+  const items = [];
+  let offset = 0;
+  const limit = 100;
+  while (true) {
+    const res = await gql(opName, "5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599", {
+      uri: artistUri,
+      offset,
+      limit,
+    });
+    const group = res?.data?.artistUnion?.discography?.[groupName];
+    const pageItems = group?.items || [];
+    for (const item of pageItems) {
+      const rel = item.releases?.items?.[0];
+      if (rel?.uri) items.push(rel);
+    }
+    offset += pageItems.length;
+    const totalCount = group?.totalCount ?? 0;
+    if (pageItems.length === 0 || offset >= totalCount || pageItems.length < limit) {
+      break;
+    }
+  }
+  return items;
+}
+
+async function mapConcurrent(items, fn, concurrency = 8) {
+  const results = new Array(items.length);
+  let index = 0;
+  const workers = new Array(Math.min(concurrency, items.length)).fill(null).map(async () => {
+    while (index < items.length) {
+      const i = index++;
+      results[i] = await fn(items[i]).catch(() => null);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+function songKey(name, artists) {
+  const tKey = (name || "").trim().toLowerCase();
+  const aKey = (artists || []).map((a) => a.id || a.name?.toLowerCase() || "").sort().join(",");
+  return `${tKey}::${aKey}`;
+}
+
 export async function artist({ id }) {
   const uri = `spotify:artist:${id}`;
   const res = await gql("queryArtistOverview", "7f86ff63e38c24973a2842b672abe44c910c1973978dc8a4a0cb648edef34527", {
@@ -855,8 +900,84 @@ export async function artist({ id }) {
   if (!artistData) throw fail("unavailable", t("artist not found"));
   const art = toArtist(artistData);
   const topTracks = (artistData.discography?.topTracks?.items || []).map((item) => toTrack(item.track));
-  const albums = (artistData.discography?.popularReleasesAlbums?.items || []).map(toAlbum);
-  return { artist: art, tracks: topTracks, albums };
+
+  // Spotify categorizes discography into albums, singles & EPs, and compilations.
+  // Query all three groups concurrently with pagination.
+  const [albumReleases, singleReleases, compilationReleases] = await Promise.all([
+    fetchDiscographyGroup("queryArtistDiscographyAlbums", "albums", uri).catch(() => []),
+    fetchDiscographyGroup("queryArtistDiscographySingles", "singles", uri).catch(() => []),
+    fetchDiscographyGroup("queryArtistDiscographyCompilations", "compilations", uri).catch(() => []),
+  ]);
+
+  const allReleases = [...albumReleases, ...singleReleases, ...compilationReleases];
+  let albums;
+  if (allReleases.length === 0) {
+    albums = (artistData.discography?.popularReleasesAlbums?.items || []).map((item) => toAlbum(item, [art]));
+  } else {
+    albums = allReleases.map((rel) => toAlbum(rel, [art]));
+  }
+
+  const albumMap = new Map();
+  for (const a of albums) {
+    if (a.id) albumMap.set(a.id, a);
+  }
+
+  // Fetch release tracks with bounded concurrency. For prolific artists with
+  // hundreds of releases, cap track fetching to the first 150 releases (albums,
+  // then singles) to avoid slow page loads and rate limiting.
+  const trackReleases = allReleases.slice(0, 150);
+  const releaseTrackItems = await mapConcurrent(
+    trackReleases,
+    async (rel) => {
+      const trackRes = await gql("queryAlbumTracks", "0b6ce3511e1b02e4a40fa95440f992acbe85080eb308af9194322d708fc1914f", {
+        uri: rel.uri,
+        offset: 0,
+        limit: 100,
+      });
+      return trackRes?.data?.albumUnion?.tracksV2?.items || [];
+    },
+    8
+  );
+
+  const seenTrackIds = new Set();
+  const seenSongKeys = new Set();
+  const tracks = [];
+
+  // Top 10 tracks first, preserving their exact order
+  for (const track of topTracks) {
+    if (!track.id) continue;
+    if (albumMap.has(track.album.id)) {
+      const match = albumMap.get(track.album.id);
+      track.album = { ...match, ...track.album, name: match.name || track.album.name };
+    }
+    seenTrackIds.add(track.id);
+    seenSongKeys.add(songKey(track.name, track.artists));
+    tracks.push(track);
+  }
+
+  // Discography tracks: albums first, then singles & EPs, then compilations.
+  // Deduplicate by track ID and by same title + artists (keeping album version
+  // over single re-releases). Filter out tracks not by this artist.
+  for (let i = 0; i < trackReleases.length; i++) {
+    const albumObj = albums[i];
+    const items = releaseTrackItems[i] || [];
+    for (const item of items) {
+      const rawTrack = item.track;
+      if (!rawTrack) continue;
+      const track = toTrack(rawTrack, albumObj);
+      if (!track.id) continue;
+      if (!track.artists?.some((a) => a.id === id)) continue;
+      if (seenTrackIds.has(track.id)) continue;
+      const key = songKey(track.name, track.artists);
+      if (seenSongKeys.has(key)) continue;
+
+      seenTrackIds.add(track.id);
+      seenSongKeys.add(key);
+      tracks.push(track);
+    }
+  }
+
+  return { artist: art, tracks, albums };
 }
 
 export async function playlist({ id }) {
