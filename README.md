@@ -31,7 +31,7 @@ On Linux, the app aborts when a plugin opens its sign-in window, so sign in with
 ## What works
 
 - Signed out: playing, Home, search (tracks, albums, artists, playlists), albums, artists, playlists, radio stations, and timed lyrics.
-- Signed in: your playlists, liked songs, liking/unliking songs, saving/unsaving albums, following/unfollowing artists, and saving/unsaving playlists.
+- Signed in: your playlists, liked songs, saved albums, followed artists, liking/unliking songs, saving/unsaving albums, following/unfollowing artists, and saving/unsaving playlists.
 - Not available: creating or reordering playlist tracks, and podcast episodes.
 
 ## How it plays
@@ -40,7 +40,7 @@ Spotify track metadata (title, artists, duration) is matched against YouTube Mus
 
 ## Lyrics
 
-From Spotify color-lyrics when available, with an automatic fallback chain: [LRCLIB](https://lrclib.net/) exact match, LRCLIB search, and [NetEase Cloud Music (网易云音乐)](https://music.163.com/) by title, artist, and duration.
+From Spotify color-lyrics when they are timed, with an automatic fallback chain: [LRCLIB](https://lrclib.net/) exact match, LRCLIB search, and [NetEase Cloud Music (网易云音乐)](https://music.163.com/) by title, artist, and duration. Lyrics without times, when no source has timed ones, are spread evenly over the song.
 
 ## Credits and License
 

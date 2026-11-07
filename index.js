@@ -636,6 +636,7 @@ export async function home() {
 
 export async function browse({ page }) {
   if (!page) return home();
+  if (page === "artists") return followedArtists();
   const spT = cookieValue(host.storage.get("cookie") || "", "sp_t");
   const uri = page.startsWith("spotify:") ? page : `spotify:section:${page}`;
   const res = await gql("homeSection", "d62af2714f2623c923cc9eeca4b9545b4363abaa9188a9e94e2b63b823419a2c", {
@@ -830,6 +831,56 @@ export async function playlists() {
     }
   }
   return out;
+}
+
+// The artists you follow, for the Artists page of the sidebar. The app has no
+// library export for them, so they come as a browse page.
+async function followedArtists() {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const limit = 50;
+  const artists = [];
+  for (let offset = 0; ; offset += limit) {
+    const res = await gql("libraryV3", "390c78e5b951029bad359785e69b07b536a509c581cbcd0aded5e5067f187455", {
+      filters: ["Artists"],
+      limit,
+      offset,
+      flatten: true,
+      expandedFolders: [],
+      folderUri: null,
+      includeFoldersWhenFlattening: true,
+    });
+    const lib = res?.data?.me?.libraryV3;
+    const items = lib?.items || [];
+    for (const libItem of items) {
+      if (libItem.item?.__typename === "ArtistResponseWrapper" && libItem.item?.data) {
+        artists.push({ ...toArtist(libItem.item.data), following: true });
+      }
+    }
+    if (items.length < limit || offset + limit >= (lib?.totalCount || 0)) break;
+  }
+  return { title: t("Artists"), sections: [{ artists }] };
+}
+
+export async function savedAlbums({ offset = 0 }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const limit = 50;
+  const res = await gql("libraryV3", "390c78e5b951029bad359785e69b07b536a509c581cbcd0aded5e5067f187455", {
+    filters: ["Albums"],
+    limit,
+    offset,
+    flatten: true,
+    expandedFolders: [],
+    folderUri: null,
+    includeFoldersWhenFlattening: true,
+  });
+  const lib = res?.data?.me?.libraryV3;
+  const items = lib?.items || [];
+  const albums = items
+    .filter((libItem) => libItem.item?.__typename === "AlbumResponseWrapper" && libItem.item?.data)
+    .map((libItem) => ({ ...toAlbum(libItem.item.data), saved: true }));
+  return { albums, more: offset + items.length < (lib?.totalCount || 0) };
 }
 
 export async function liked({ offset = 0 }) {
@@ -1051,7 +1102,23 @@ function scoreLyricCandidate(c, target) {
   return { score: titleScore + artistScore + durScore + syncScore, diffSec };
 }
 
+// Lyrics with no times, spread evenly over the song. Given as they are, every
+// line would start at 0 and the app would scroll straight to the last one.
+function spreadPlainLyrics(text, durationMs) {
+  const texts = text.split(/\r?\n/).map((l) => l.trim());
+  while (texts.length && !texts[texts.length - 1]) texts.pop();
+  if (!texts.length) return { lrc: "" };
+  const step = durationMs ? durationMs / texts.length : 4000;
+  return { lines: texts.map((line, i) => ({ start: Math.round(i * step), text: line })) };
+}
+
+const hasLrcTimes = (lrc) => /^\s*\[\d+:\d+/m.test(lrc);
+
 export async function lyrics({ id }) {
+  // The first lyrics without times that are found, if none of the sources has
+  // timed ones.
+  let plain = "";
+
   // 1. Try Spotify color-lyrics (if available)
   try {
     const token = await getToken();
@@ -1073,7 +1140,9 @@ export async function lyrics({ id }) {
     if (res.ok) {
       const data = await res.json();
       const lines = data.lyrics?.lines;
-      if (Array.isArray(lines) && lines.length) {
+      if (Array.isArray(lines) && lines.length && data.lyrics.syncType === "UNSYNCED") {
+        plain = lines.map((l) => l.words || "").join("\n");
+      } else if (Array.isArray(lines) && lines.length) {
         return {
           lines: lines.map((l) => ({
             start: Number(l.startTimeMs) || 0,
@@ -1091,6 +1160,7 @@ export async function lyrics({ id }) {
   let artistName = "";
   let artists = [];
   let durationSec = 0;
+  let durationMs = 0;
   try {
     const tRes = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
       uri: `spotify:track:${id}`,
@@ -1105,14 +1175,15 @@ export async function lyrics({ id }) {
       ]
         .map((a) => a?.profile?.name)
         .filter(Boolean);
-      durationSec = Math.round((tData.duration?.totalMilliseconds || 0) / 1000);
+      durationMs = tData.duration?.totalMilliseconds || 0;
+      durationSec = Math.round(durationMs / 1000);
     }
   } catch (e) {
     console.warn("lyrics metadata error:", e.message);
   }
 
   if (!trackName) {
-    return { lrc: "" };
+    return plain ? spreadPlainLyrics(plain, durationMs) : { lrc: "" };
   }
 
   const target = { name: trackName, artist: artistName, artists, durationSec };
@@ -1125,10 +1196,10 @@ export async function lyrics({ id }) {
     });
     if (lrcRes.ok) {
       const lrcData = await lrcRes.json();
-      const lyric = lrcData.syncedLyrics || lrcData.plainLyrics;
-      if (lyric && lyric.trim()) {
-        return { lrc: lyric };
+      if (lrcData.syncedLyrics?.trim()) {
+        return { lrc: lrcData.syncedLyrics };
       }
+      plain ||= lrcData.plainLyrics?.trim() || "";
     }
   } catch (e) {
     console.warn("lrclib get error:", e.message);
@@ -1167,9 +1238,11 @@ export async function lyrics({ id }) {
             }
           }
           scored.sort((a, b) => b.score - a.score);
-          if (scored.length > 0) {
-            return { lrc: scored[0].cand.lyric };
+          const timed = scored.find((item) => item.cand.hasSync);
+          if (timed) {
+            return { lrc: timed.cand.lyric };
           }
+          plain ||= scored[0]?.cand.lyric.trim() || "";
         }
       }
     }
@@ -1219,7 +1292,8 @@ export async function lyrics({ id }) {
             if (lrc && typeof lrc === "string") {
               const clean = lrc.trim();
               if (clean && !clean.includes("纯音乐，请欣赏")) {
-                return { lrc: clean };
+                if (hasLrcTimes(clean)) return { lrc: clean };
+                plain ||= clean;
               }
             }
           }
@@ -1233,7 +1307,7 @@ export async function lyrics({ id }) {
     console.warn("netease lyrics error:", e.message);
   }
 
-  return { lrc: "" };
+  return plain ? spreadPlainLyrics(plain, durationMs) : { lrc: "" };
 }
 
 // ============================================================================

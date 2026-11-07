@@ -41,7 +41,15 @@
       "builtin": "stations"
     },
     {
+      "title": "Artists",
+      "page": "artists",
+      "icon": "artist"
+    },
+    {
       "builtin": "liked"
+    },
+    {
+      "builtin": "savedAlbums"
     }
   ]
 }
