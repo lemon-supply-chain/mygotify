@@ -415,7 +415,7 @@ function toArtist(raw) {
     id,
     name,
     imageUrl,
-    following: Boolean(raw.following),
+    following: Boolean(raw.following ?? raw.saved),
   };
 }
 
