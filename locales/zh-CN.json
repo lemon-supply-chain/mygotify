@@ -24,5 +24,8 @@
   "sp_dc cookie": "sp_dc Cookie",
   "Sign in at open.spotify.com in your browser, then copy the sp_dc cookie from its developer tools (Storage > Cookies). Needed on Linux, optional elsewhere.": "在浏览器里登录 open.spotify.com，然后从开发者工具（存储 > Cookie）复制 sp_dc 的值。Linux 上必填，其他系统可选。",
   "Paste your sp_dc cookie in the settings to sign in": "请先在设置里粘贴 sp_dc Cookie 再登录",
-  "Artists": "艺人"
+  "Artists": "艺人",
+  "Made For You": "为你推荐",
+  "Recently Played": "最近播放",
+  "Songs you play will show here": "播放过的歌曲会显示在这里"
 }

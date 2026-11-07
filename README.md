@@ -31,7 +31,8 @@ On Linux, the app aborts when a plugin opens its sign-in window, so sign in with
 ## What works
 
 - Signed out: playing, Home, search (tracks, albums, artists, playlists), albums, artists, playlists, radio stations, and timed lyrics.
-- Signed in: your playlists, liked songs, saved albums, followed artists, liking/unliking songs, saving/unsaving albums, following/unfollowing artists, and saving/unsaving playlists.
+- Signed in: your playlists, liked songs, saved albums, followed artists, Made For You (Daily Mixes, Discover Weekly, Release Radar and your top mixes), liking/unliking songs, saving/unsaving albums, following/unfollowing artists, and saving/unsaving playlists.
+- Recently Played lists the last 50 songs played in MyGo Music, kept on this machine: what plays here never reaches your Spotify history. The app keeps a sidebar page once loaded, so for songs played since, open My Page from the account menu, which loads anew each time.
 - Not available: creating or reordering playlist tracks, and podcast episodes.
 
 ## How it plays

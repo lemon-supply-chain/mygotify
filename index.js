@@ -444,7 +444,7 @@ function toTrack(raw, fallbackAlbum = null) {
   if (!raw) return { id: "", name: "", album: { id: "", name: "" }, duration: 0 };
   const id = raw.uri ? raw.uri.replace(/^spotify:track:/, "") : raw.id || "";
   const name = raw.name || "";
-  const artists = (raw.artists?.items || raw.firstArtist?.items || []).map(toArtist);
+  const artists = (raw.artists?.items || [...(raw.firstArtist?.items || []), ...(raw.otherArtists?.items || [])]).map(toArtist);
   const album = raw.albumOfTrack ? toAlbum(raw.albumOfTrack) : fallbackAlbum || { id: "", name: "" };
   // Playlists, and so the home page and radio, name it trackDuration. Without
   // it the app can't seek, as the MP3 it's served is live and has no length.
@@ -550,6 +550,7 @@ export async function account() {
       id: profile.uri ? profile.uri.replace(/^spotify:user:/, "") : profile.username,
       name: profile.name || profile.username,
       imageUrl: imageOf(profile.avatar),
+      page: "me",
     };
   } catch (e) {
     console.warn("account query failed:", e.message);
@@ -634,9 +635,77 @@ export async function home() {
   return { title: t("Home"), sections };
 }
 
+// The home page's shelves of mixes made for the listener: the Daily Mixes,
+// Discover Weekly and Release Radar, then their top mixes.
+const madeForYouShelves = ["spotify:section:0JQ5DAUnp4wcj0bCb3wh3S", "spotify:section:0JQ5DAnM3wGh0gz1MXnu89"];
+
+async function madeForYou() {
+  const shelves = await Promise.allSettled(madeForYouShelves.map((uri) => browse({ page: uri })));
+  const sections = shelves.flatMap((shelf) => (shelf.status === "fulfilled" ? shelf.value.sections : []));
+  const failed = shelves.find((shelf) => shelf.status === "rejected");
+  if (!sections.length && failed) throw failed.reason;
+  return { title: t("Made For You"), sections };
+}
+
+// What was played here, newest first. Spotify's own history has only what its
+// apps played, and these songs never reach it.
+const historyLength = 50;
+
+function remember(id) {
+  const history = (host.storage.get("history") || []).filter((h) => h !== id);
+  history.unshift(id);
+  host.storage.set("history", history.slice(0, historyLength));
+}
+
+// Each song is asked for once and kept for as long as it's in the history.
+async function recentlyPlayed() {
+  const history = host.storage.get("history") || [];
+  const old = host.storage.get("historyTracks") || {};
+  const kept = {};
+  for (const id of history) if (old[id]) kept[id] = old[id];
+  const missing = history.filter((id) => !kept[id]);
+  for (let i = 0; i < missing.length; i += 5) {
+    await Promise.all(
+      missing.slice(i, i + 5).map(async (id) => {
+        try {
+          const res = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
+            uri: `spotify:track:${id}`,
+          });
+          if (res?.data?.trackUnion) kept[id] = toTrack(res.data.trackUnion);
+        } catch (e) {
+          console.warn(`recently played ${id}: ${e.message}`);
+        }
+      })
+    );
+  }
+  host.storage.set("historyTracks", kept);
+  const tracks = history.map((id) => kept[id]).filter(Boolean);
+  return { title: t("Recently Played"), sections: [{ tracks, empty: t("Songs you play will show here") }] };
+}
+
+// The listener's own page, from the account menu. The app loads it anew each
+// time it's opened, unlike the sidebar's pages, so it's where what was just
+// played shows at once.
+async function myPage() {
+  const me = await account();
+  if (!me) throw fail("signIn");
+  const [recent, artists] = await Promise.allSettled([recentlyPlayed(), followedArtists()]);
+  const sections = [];
+  if (recent.status === "fulfilled") {
+    sections.push({ ...recent.value.sections[0], title: t("Recently Played"), morePage: "recent" });
+  }
+  if (artists.status === "fulfilled") {
+    sections.push({ ...artists.value.sections[0], title: t("Artists"), morePage: "artists" });
+  }
+  return { title: me.name, imageUrl: me.imageUrl, sections };
+}
+
 export async function browse({ page }) {
   if (!page) return home();
   if (page === "artists") return followedArtists();
+  if (page === "madeForYou") return madeForYou();
+  if (page === "recent") return recentlyPlayed();
+  if (page === "me") return myPage();
   const spT = cookieValue(host.storage.get("cookie") || "", "sp_t");
   const uri = page.startsWith("spotify:") ? page : `spotify:section:${page}`;
   const res = await gql("homeSection", "d62af2714f2623c923cc9eeca4b9545b4363abaa9188a9e94e2b63b823419a2c", {
@@ -996,6 +1065,7 @@ export function stations() {
 
 export function played({ id }) {
   host.storage.set("lastPlayed", id);
+  remember(id);
 }
 
 export async function stationNext() {

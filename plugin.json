@@ -38,6 +38,16 @@
       "builtin": "home"
     },
     {
+      "title": "Made For You",
+      "page": "madeForYou",
+      "icon": "star"
+    },
+    {
+      "title": "Recently Played",
+      "page": "recent",
+      "icon": "calendar"
+    },
+    {
       "builtin": "stations"
     },
     {
