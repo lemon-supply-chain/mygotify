@@ -1,6 +1,6 @@
-# Spotify for MyGo Music
+# MyGotify
 
-Plays Spotify in [MyGo Music](https://github.com/egoist/mygo-music) with audio provided via YouTube Music. It isn't affiliated with or endorsed by Spotify, YouTube, or Google, uses private APIs, and may stop working at any time.
+MyGotify plays Spotify in [MyGo Music](https://github.com/egoist/mygo-music) with audio provided via YouTube Music. It isn't affiliated with or endorsed by Spotify, YouTube, or Google, uses private APIs, and may stop working at any time.
 
 ## Install
 
@@ -14,11 +14,11 @@ yt-dlp needs a JavaScript runtime (Deno, Node or Bun) to solve YouTube's challen
 
 Install with the deeplink:
 
-[mygo-music://install-plugin?repo=r0k1s_i/mygo-music-spotube](mygo-music://install-plugin?repo=r0k1s_i/mygo-music-spotube)
+[mygo-music://install-plugin?repo=r0k1s-i/mygotify](mygo-music://install-plugin?repo=r0k1s-i/mygotify)
 
 Or paste the GitHub URL in Settings > Plugins.
 
-In Settings > Plugins, allow Spotify to start programs. To get your library, click **Sign In** and sign in to Spotify in the window that opens.
+In Settings > Plugins, allow MyGotify to start programs. To get your library, click **Sign In** and sign in to Spotify in the window that opens.
 
 It needs MyGo Music 0.1.8 or later, and only starts ffmpeg and yt-dlp: from the PATH, `/opt/homebrew/bin` or `/usr/local/bin`. If they're somewhere else, link them into one of those.
 
@@ -26,7 +26,7 @@ It needs MyGo Music 0.1.8 or later, and only starts ffmpeg and yt-dlp: from the 
 
 You sign in on Spotify's login page, in a window of the app. The session cookie (`sp_dc`) is stored unencrypted in the plugin's data on this machine and is used to obtain web player access tokens. Signing out forgets it.
 
-On Linux, the app aborts when a plugin opens its sign-in window, so sign in with the cookie instead: sign in at [open.spotify.com](https://open.spotify.com) in your browser, copy the value of the `sp_dc` cookie from its developer tools (Storage > Cookies), paste it in Settings > Plugins > Spotify, and click **Sign In**. A cookie pasted there is used on other platforms too, without the window. Changing it signs you out.
+On Linux, the app aborts when a plugin opens its sign-in window, so sign in with the cookie instead: sign in at [open.spotify.com](https://open.spotify.com) in your browser, copy the value of the `sp_dc` cookie from its developer tools (Storage > Cookies), paste it in Settings > Plugins > MyGotify, and click **Sign In**. A cookie pasted there is used on other platforms too, without the window. Changing it signs you out.
 
 ## What works
 

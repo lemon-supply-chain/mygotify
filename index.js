@@ -1565,7 +1565,7 @@ async function program(name, versionFlag) {
       }
     } catch (e) {
       if (/allowed/.test(e.message)) {
-        throw fail("setup", t("Allow Spotify to start programs in its settings"));
+        throw fail("setup", t("Allow MyGotify to start programs in its settings"));
       }
     }
   }
@@ -1698,7 +1698,7 @@ function stopWaiting() {
 async function serve(source, bitRate) {
   const ffmpeg = await program("ffmpeg", "-version");
   if (!ffmpeg) {
-    throw fail("setup", t("Spotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
+    throw fail("setup", t("MyGotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
   }
   const pieces = await asksInPieces(ffmpeg);
   stopWaiting();
