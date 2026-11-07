@@ -39,11 +39,11 @@ brew install ffmpeg yt-dlp
 
 yt-dlp needs a JavaScript runtime (Deno, Node or Bun) to solve YouTube's challenges; Homebrew includes Deno. Keep yt-dlp up to date, as YouTube changes often.
 
-Install with the deeplink:
+In Settings > Plugins, click **+** and enter:
 
-[mygo-music://install-plugin?repo=r0k1s-i/mygotify](mygo-music://install-plugin?repo=r0k1s-i/mygotify)
-
-Or paste the GitHub URL in Settings > Plugins.
+```
+r0k1s-i/mygotify
+```
 
 In Settings > Plugins, allow MyGotify to start programs. To get your library, click **Sign In** and sign in to Spotify in the window that opens.
 
@@ -104,11 +104,11 @@ brew install ffmpeg yt-dlp
 
 yt-dlp 需要一个 JavaScript 运行时（Deno、Node 或 Bun）来通过 YouTube 的验证，Homebrew 会一起装上 Deno。YouTube 经常变动，请保持 yt-dlp 为最新版本。
 
-点击深链接安装：
+在 设置 > 插件 中点击 **+**，输入：
 
-[mygo-music://install-plugin?repo=r0k1s-i/mygotify](mygo-music://install-plugin?repo=r0k1s-i/mygotify)
-
-或者在 设置 > 插件 中粘贴本仓库的 GitHub 地址。
+```
+r0k1s-i/mygotify
+```
 
 然后在 设置 > 插件 中允许 MyGotify 启动程序。要读取你的音乐库，点击 **登录**，在弹出的窗口里登录 Spotify。
 
