@@ -27,7 +27,6 @@ MyGotify brings Spotify's catalog, your library and its recommendations to [MyGo
 - **Works without an account.** Search, albums, artists, playlists, radio and lyrics need no sign-in.
 - **The right recording.** Each song is matched on YouTube Music by title, artists and length, and the match is remembered, so it starts faster next time.
 - **Your listening stays yours.** What you play here never reaches your Spotify history; Recently Played is kept on your machine.
-- **Speaks Chinese.** The plugin's interface is translated into Simplified Chinese.
 
 ## Install
 
@@ -84,7 +83,7 @@ From Spotify color-lyrics when they are timed, with an automatic fallback chain:
 
 MyGotify 把 Spotify 的曲库、你的音乐库和推荐带进 [MyGo Music](https://github.com/egoist/mygo-music)，音频则来自 YouTube Music。本插件与 Spotify、YouTube、Google 均无关联，也未获其认可；它使用的是非公开接口，随时可能失效。
 
-### 选择MyGotify 🪩
+### 选择 MyGotify 🪩
 
 - **无须订阅，没有广告。** 用 Spotify 找歌，用 YouTube Music 播放，歌与歌之间没有任何插播。
 - **更全的歌词。** Spotify 没有逐行歌词时，会依次去 [LRCLIB](https://lrclib.net/) 和[网易云音乐](https://music.163.com/)找，华语、日语、韩语歌曲的覆盖率高得多。只有纯文本、没有时间轴的歌词，也会跟着歌曲滚动。
@@ -92,7 +91,6 @@ MyGotify 把 Spotify 的曲库、你的音乐库和推荐带进 [MyGo Music](htt
 - **无须登录。** 搜索、专辑、艺人、歌单、电台和歌词都不需要账号。
 - **匹配准确。** 每首歌按歌名、艺人和时长在 YouTube Music 上匹配，匹配结果会被记住，下次播放更快。
 - **听歌记录留在本地。** 在这里播放的歌曲不会进入你的 Spotify 播放历史；“最近播放”只保存在你的电脑上。
-
 
 ### 安装
 
