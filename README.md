@@ -1,6 +1,21 @@
-# MyGotify
+<p align="center">
+  <img src="assets/logo.svg" width="128" height="128" alt="MyGotify logo">
+</p>
 
-**English** | [中文](#中文)
+<h1 align="center">MyGotify</h1>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="License: AGPL-3.0"></a>
+  <a href="plugin.json"><img src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fr0k1s-i%2Fmygotify%2Fmain%2Fplugin.json&query=%24.version&label=version&prefix=v" alt="Version"></a>
+  <a href="https://github.com/egoist/mygo-music"><img src="https://img.shields.io/badge/MyGo_Music-%E2%89%A5_0.1.8-informational" alt="MyGo Music ≥ 0.1.8"></a>
+  <a href="#install"><img src="https://img.shields.io/badge/Install-Plugin-10b981" alt="Install Plugin"></a>
+  <a href="https://github.com/r0k1s-i/mygotify/stargazers"><img src="https://img.shields.io/github/stars/r0k1s-i/mygotify?style=flat" alt="GitHub Stars"></a>
+  <a href="https://github.com/r0k1s-i/mygotify/commits/main"><img src="https://img.shields.io/github/last-commit/r0k1s-i/mygotify" alt="Last Commit"></a>
+</p>
+
+<p align="center">
+  <strong>English</strong> | <a href="#中文">中文</a>
+</p>
 
 MyGotify brings Spotify's catalog, your library and its recommendations to [MyGo Music](https://github.com/egoist/mygo-music), and plays the audio from YouTube Music. It isn't affiliated with or endorsed by Spotify, YouTube, or Google, uses private APIs, and may stop working at any time.
 
