@@ -1,0 +1,1325 @@
+/*
+ * Spotify plugin for MyGo Music (Spotify catalog + YouTube audio)
+ *
+ * Copyright (C) 2026 Sonic Liberation (spotube-plugin-spotify)
+ * Copyright (C) 2026 r0k1s_i
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Attribution:
+ * - Spotify Web Player protocol, TOTP auth, and Pathfinder GraphQL queries
+ *   ported from sonic-liberation/spotube-plugin-spotify (AGPL-3.0).
+ * - YouTube Music search, VisionOS player stream fetching, and ffmpeg/yt-dlp
+ *   audio pipeline adapted from egoist/mygo-music-youtube-music, which states
+ *   no license: that part is not covered by the AGPL grant above until its
+ *   author licenses it.
+ */
+
+const t = host.t;
+
+function fail(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+function cookieValue(cookieStr, name) {
+  if (!cookieStr) return "";
+  for (const part of cookieStr.split(";")) {
+    const at = part.indexOf("=");
+    if (at === -1) continue;
+    if (part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
+  }
+  return "";
+}
+
+const webUA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+const visionUA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+
+// ============================================================================
+// Cryptography: Pure JS SHA-1, HMAC-SHA1, Base32, and TOTP (RFC 6238)
+// ============================================================================
+
+function sha1Raw(bytes) {
+  const totalLen = bytes.length;
+  const bitLen = totalLen * 8;
+  const paddedLen = Math.ceil((totalLen + 9) / 64) * 64;
+  const buf = new Uint8Array(paddedLen);
+  buf.set(bytes);
+  buf[totalLen] = 0x80;
+  const view = new DataView(buf.buffer);
+  view.setUint32(paddedLen - 4, bitLen, false);
+
+  let [h0, h1, h2, h3, h4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+  const rotl = (x, n) => (x << n) | (x >>> (32 - n));
+  const w = new Uint32Array(80);
+
+  for (let at = 0; at < paddedLen; at += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(at + i * 4, false);
+    }
+    for (let i = 16; i < 80; i++) {
+      w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    }
+    let [a, b, c, d, e] = [h0, h1, h2, h3, h4];
+    for (let i = 0; i < 80; i++) {
+      let f, k;
+      if (i < 20) {
+        f = (b & c) | (~b & d);
+        k = 0x5a827999;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ed9eba1;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8f1bbcdc;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xca62c1d6;
+      }
+      const temp = (rotl(a, 5) + f + e + k + w[i]) | 0;
+      e = d;
+      d = c;
+      c = rotl(b, 30);
+      b = a;
+      a = temp;
+    }
+    h0 = (h0 + a) | 0;
+    h1 = (h1 + b) | 0;
+    h2 = (h2 + c) | 0;
+    h3 = (h3 + d) | 0;
+    h4 = (h4 + e) | 0;
+  }
+  const out = new Uint8Array(20);
+  const outView = new DataView(out.buffer);
+  outView.setUint32(0, h0, false);
+  outView.setUint32(4, h1, false);
+  outView.setUint32(8, h2, false);
+  outView.setUint32(12, h3, false);
+  outView.setUint32(16, h4, false);
+  return out;
+}
+
+function hmacSha1(keyBytes, messageBytes) {
+  const blockSize = 64;
+  let k = keyBytes;
+  if (k.length > blockSize) {
+    k = sha1Raw(k);
+  }
+  const paddedKey = new Uint8Array(blockSize);
+  paddedKey.set(k);
+
+  const oPad = new Uint8Array(blockSize);
+  const iPad = new Uint8Array(blockSize);
+  for (let i = 0; i < blockSize; i++) {
+    oPad[i] = paddedKey[i] ^ 0x5c;
+    iPad[i] = paddedKey[i] ^ 0x36;
+  }
+
+  const innerMsg = new Uint8Array(blockSize + messageBytes.length);
+  innerMsg.set(iPad, 0);
+  innerMsg.set(messageBytes, blockSize);
+  const innerHash = sha1Raw(innerMsg);
+
+  const outerMsg = new Uint8Array(blockSize + innerHash.length);
+  outerMsg.set(oPad, 0);
+  outerMsg.set(innerHash, blockSize);
+  return sha1Raw(outerMsg);
+}
+
+function base32Decode(str) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const clean = str.toUpperCase().replace(/=+$/, "");
+  let bits = 0;
+  let value = 0;
+  const bytes = [];
+  for (let i = 0; i < clean.length; i++) {
+    const idx = alphabet.indexOf(clean[i]);
+    if (idx === -1) continue;
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+function totp(keyBytes, timeSec, digits = 6, period = 30) {
+  const counter = Math.floor(timeSec / period);
+  const counterBuf = new Uint8Array(8);
+  const view = new DataView(counterBuf.buffer);
+  const hi = Math.floor(counter / 0x100000000);
+  const lo = counter >>> 0;
+  view.setUint32(0, hi, false);
+  view.setUint32(4, lo, false);
+
+  const hash = hmacSha1(keyBytes, counterBuf);
+  const offset = hash[hash.length - 1] & 0x0f;
+  const binary =
+    ((hash[offset] & 0x7f) << 24) |
+    ((hash[offset + 1] & 0xff) << 16) |
+    ((hash[offset + 2] & 0xff) << 8) |
+    (hash[offset + 3] & 0xff);
+  const mod = 10 ** digits;
+  return (binary % mod).toString().padStart(digits, "0");
+}
+
+// ============================================================================
+// Spotify Authentication & Web Player Token Generation
+// ============================================================================
+
+const FALLBACK_NUANCE = {
+  s: "GM3TMMJTGYZTQNZVGM4DINJZHA4TGOBYGMZTCMRTGEYDSMJRHE4TEOBUG4YTCMRUGQ4DQOJUGQYTAMRRGA2TCMJSHE3TCMBY",
+  v: 61,
+};
+
+async function getNuance(bustCache = false) {
+  try {
+    const url = bustCache
+      ? `https://gist.githubusercontent.com/raw/22ed9c6ba463899e933427f7de1f0eef/nuances.json?t=${Date.now()}`
+      : "https://gist.githubusercontent.com/raw/22ed9c6ba463899e933427f7de1f0eef/nuances.json";
+    const res = await fetch(url);
+    if (res.ok) {
+      const list = await res.json();
+      if (Array.isArray(list) && list.length > 0) {
+        return list.reduce((max, item) => (item.v > max.v ? item : max), list[0]);
+      }
+    }
+  } catch (e) {
+    console.warn("nuance fetch error:", e.message);
+  }
+  return FALLBACK_NUANCE;
+}
+
+async function getServerTime() {
+  try {
+    const res = await fetch("https://open.spotify.com/api/server-time");
+    if (res.ok) {
+      const data = await res.json();
+      if (data.serverTime) return Number(data.serverTime);
+    }
+  } catch (e) {
+    console.warn("server-time fetch error:", e.message);
+  }
+  return Math.floor(Date.now() / 1000);
+}
+
+let tokenInfo = null;
+
+async function requestToken(spDc = "", bustNuance = false) {
+  const nuance = await getNuance(bustNuance);
+  const serverTime = await getServerTime();
+  const keyBytes = base32Decode(nuance.s);
+  const otp = totp(keyBytes, serverTime);
+
+  const tokenUrl = `https://open.spotify.com/api/token?reason=transport&productType=web-player&totp=${otp}&totpServer=${otp}&totpVer=${nuance.v}`;
+  const headers = { "User-Agent": webUA };
+  if (spDc) {
+    headers["Cookie"] = `sp_dc=${spDc};`;
+  }
+  const res = await fetch(tokenUrl, { headers });
+  if (!res.ok) {
+    if (!bustNuance) {
+      return requestToken(spDc, true);
+    }
+    throw new Error(`Spotify token error: ${res.status}`);
+  }
+  const data = await res.json();
+  return {
+    accessToken: data.accessToken,
+    expiresAt: data.accessTokenExpirationTimestampMs || Date.now() + 3600000,
+    isAnonymous: Boolean(data.isAnonymous),
+    spDc,
+  };
+}
+
+async function getToken() {
+  const spDc = host.storage.get("sp_dc") || "";
+  const now = Date.now();
+  // Check memory token
+  if (tokenInfo && tokenInfo.spDc === spDc && tokenInfo.expiresAt - now > 60000) {
+    return tokenInfo.accessToken;
+  }
+  // Check persisted storage
+  const stored = host.storage.get("token");
+  if (stored && stored.spDc === spDc && stored.expiresAt - now > 60000) {
+    tokenInfo = stored;
+    return tokenInfo.accessToken;
+  }
+  tokenInfo = await requestToken(spDc);
+  host.storage.set("token", tokenInfo);
+  return tokenInfo.accessToken;
+}
+
+// ============================================================================
+// Spotify Pathfinder GraphQL Client
+// ============================================================================
+
+async function gql(operationName, sha256Hash, variables = {}) {
+  let token = await getToken();
+  const spDc = host.storage.get("sp_dc");
+  const headers = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+    Authorization: `Bearer ${token}`,
+    "User-Agent": webUA,
+  };
+  if (spDc) {
+    headers["Cookie"] = `sp_dc=${spDc}`;
+  }
+  let res = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      operationName,
+      variables,
+      extensions: {
+        persistedQuery: {
+          version: 1,
+          sha256Hash,
+        },
+      },
+    }),
+  });
+
+  if (res.status === 401) {
+    // Retry once with refreshed token
+    tokenInfo = null;
+    host.storage.remove("token");
+    token = await getToken();
+    headers["Authorization"] = `Bearer ${token}`;
+    res = await fetch("https://api-partner.spotify.com/pathfinder/v2/query", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        operationName,
+        variables,
+        extensions: {
+          persistedQuery: {
+            version: 1,
+            sha256Hash,
+          },
+        },
+      }),
+    });
+    if (res.status === 401) {
+      if (spDc) {
+        signOut();
+        throw fail("signIn", t("Your Spotify session has ended: sign in again"));
+      }
+    }
+  }
+
+  if (!res.ok) {
+    throw new Error(`Spotify GQL ${operationName}: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ============================================================================
+// Data Transformation & Model Mappers
+// ============================================================================
+
+function cleanDescription(text) {
+  if (!text) return "";
+  return text
+    .replace(/<[^>]*>/g, "")
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
+
+function imageOf(node) {
+  if (!node) return undefined;
+  const list = node.sources || (node.items && node.items[0]?.sources) || [];
+  if (!list.length) return undefined;
+  const sorted = [...list].sort((a, b) => (b.width || 0) - (a.width || 0));
+  return sorted[0]?.url;
+}
+
+function toArtist(raw) {
+  if (!raw) return { id: "", name: "" };
+  const id = raw.uri ? raw.uri.replace(/^spotify:artist:/, "") : raw.id || "";
+  const name = raw.profile?.name || raw.name || "";
+  const imageUrl = imageOf(raw.visuals?.avatarImage || raw.images);
+  return {
+    id,
+    name,
+    imageUrl,
+    following: Boolean(raw.following),
+  };
+}
+
+function toAlbum(raw) {
+  if (!raw) return { id: "", name: "" };
+  const id = raw.uri ? raw.uri.replace(/^spotify:album:/, "") : raw.id || "";
+  const name = raw.name || "";
+  const imageUrl = imageOf(raw.coverArt || raw.images);
+  const artists = (raw.artists?.items || []).map(toArtist);
+  const released = raw.date?.isoString || (raw.date?.year ? String(raw.date.year) : "");
+  return {
+    id,
+    name,
+    imageUrl,
+    artists,
+    released,
+    saved: Boolean(raw.saved),
+  };
+}
+
+function toTrack(raw, fallbackAlbum = null) {
+  if (!raw) return { id: "", name: "", album: { id: "", name: "" }, duration: 0 };
+  const id = raw.uri ? raw.uri.replace(/^spotify:track:/, "") : raw.id || "";
+  const name = raw.name || "";
+  const artists = (raw.artists?.items || raw.firstArtist?.items || []).map(toArtist);
+  const album = raw.albumOfTrack ? toAlbum(raw.albumOfTrack) : fallbackAlbum || { id: "", name: "" };
+  const duration = raw.duration?.totalMilliseconds || 0;
+  const url = raw.sharingInfo?.shareUrl || (id ? `https://open.spotify.com/track/${id}` : "");
+  const unavailable = raw.playability?.playable === false ? true : undefined;
+  return {
+    id,
+    name,
+    artists,
+    album,
+    duration,
+    url,
+    unavailable,
+  };
+}
+
+function toPlaylist(raw, tracks = []) {
+  if (!raw) return { id: "", name: "" };
+  const id = raw.uri ? raw.uri.replace(/^spotify:playlist:/, "") : raw.id || "";
+  const name = raw.name || "";
+  const imageUrl = imageOf(raw.images);
+  const description = cleanDescription(raw.description);
+  const owner = raw.ownerV2?.data?.name || raw.ownerV2?.data?.username || "";
+  const trackCount = raw.content?.totalCount || tracks.length;
+  return {
+    id,
+    name,
+    imageUrl,
+    description,
+    owner,
+    trackCount,
+    tracks,
+  };
+}
+
+// ============================================================================
+// Plugin Exports: Authentication & User Account
+// ============================================================================
+
+export async function signIn() {
+  const { cookie: cookieHeader } = await host.webSignIn({
+    url: "https://accounts.spotify.com/en/login",
+    cookiesOf: "https://open.spotify.com",
+    until: ["sp_dc"],
+  });
+  const spDc = cookieValue(cookieHeader, "sp_dc");
+  if (!spDc) {
+    throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+  }
+  host.storage.set("sp_dc", spDc);
+  host.storage.set("cookie", cookieHeader);
+  tokenInfo = null;
+  host.storage.remove("token");
+  const acc = await account();
+  if (!acc) {
+    throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+  }
+  return acc;
+}
+
+export function signOut() {
+  host.storage.remove("sp_dc");
+  host.storage.remove("cookie");
+  host.storage.remove("token");
+  tokenInfo = null;
+}
+
+export async function account() {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) return null;
+  try {
+    const res = await gql("profileAttributes", "53bcb064f6cd18c23f752bc324a791194d20df612d8e1239c735144ab0399ced", {});
+    const profile = res?.data?.me?.profile;
+    if (!profile) return null;
+    return {
+      id: profile.uri ? profile.uri.replace(/^spotify:user:/, "") : profile.username,
+      name: profile.name || profile.username,
+      imageUrl: imageOf(profile.avatar),
+    };
+  } catch (e) {
+    console.warn("account query failed:", e.message);
+    return null;
+  }
+}
+
+// ============================================================================
+// Plugin Exports: Home & Browse
+// ============================================================================
+
+export async function home() {
+  const spT = cookieValue(host.storage.get("cookie") || "", "sp_t");
+  const res = await gql("home", "3357ffed7961629ba92b4e0a41514e4d5004a14355c964c23ce442205c9e44a1", {
+    timeZone: "UTC",
+    sp_t: spT,
+    facet: "",
+    sectionItemsLimit: 20,
+  });
+  const rawSections = res?.data?.home?.sectionContainer?.sections?.items || [];
+  const sections = [];
+  for (const s of rawSections) {
+    const title = s.data?.title?.transformedLabel || s.data?.title?.text;
+    if (!title) continue;
+    const items = s.sectionItems?.items || [];
+    const sec = {
+      title,
+      tracks: [],
+      albums: [],
+      artists: [],
+      playlists: [],
+    };
+    for (const it of items) {
+      const c = it.content;
+      if (!c || !c.data) continue;
+      switch (c.__typename) {
+        case "TrackResponseWrapper":
+          sec.tracks.push(toTrack(c.data));
+          break;
+        case "AlbumResponseWrapper":
+          sec.albums.push(toAlbum(c.data));
+          break;
+        case "ArtistResponseWrapper":
+          sec.artists.push(toArtist(c.data));
+          break;
+        case "PlaylistResponseWrapper":
+          sec.playlists.push(toPlaylist(c.data));
+          break;
+      }
+    }
+    if (sec.tracks.length || sec.albums.length || sec.artists.length || sec.playlists.length) {
+      sections.push(sec);
+    }
+  }
+  return { title: t("Home"), sections };
+}
+
+export async function browse({ page }) {
+  if (!page) return home();
+  const spT = cookieValue(host.storage.get("cookie") || "", "sp_t");
+  const uri = page.startsWith("spotify:") ? page : `spotify:section:${page}`;
+  const res = await gql("homeSection", "d62af2714f2623c923cc9eeca4b9545b4363abaa9188a9e94e2b63b823419a2c", {
+    uri,
+    timeZone: "UTC",
+    sp_t: spT,
+    sectionItemsOffset: 0,
+    sectionItemsLimit: 50,
+  });
+  const first = res?.data?.homeSections?.sections?.[0];
+  if (!first || first.__typename === "NotFound") {
+    throw fail("unavailable", t("no such page"));
+  }
+  const title = first.data?.title?.transformedLabel || t("Browse");
+  const items = first.sectionItems?.items || [];
+  const sec = { title, tracks: [], albums: [], artists: [], playlists: [] };
+  for (const it of items) {
+    const c = it.content;
+    if (!c || !c.data) continue;
+    switch (c.__typename) {
+      case "TrackResponseWrapper":
+        sec.tracks.push(toTrack(c.data));
+        break;
+      case "AlbumResponseWrapper":
+        sec.albums.push(toAlbum(c.data));
+        break;
+      case "ArtistResponseWrapper":
+        sec.artists.push(toArtist(c.data));
+        break;
+      case "PlaylistResponseWrapper":
+        sec.playlists.push(toPlaylist(c.data));
+        break;
+    }
+  }
+  return { title, sections: [sec] };
+}
+
+// ============================================================================
+// Plugin Exports: Catalog Search
+// ============================================================================
+
+export async function search({ query, kind, offset = 0 }) {
+  const limit = 20;
+  switch (kind) {
+    case "tracks": {
+      const res = await gql("searchTracks", "bc1ca2fcd0ba1013a0fc88e6cc4f190af501851e3dafd3e1ef85840297694428", {
+        searchTerm: query,
+        offset,
+        limit,
+        includePreReleases: false,
+        numberOfTopResults: 20,
+        includeAudiobooks: true,
+        includeAuthors: false,
+      });
+      const data = res?.data?.searchV2?.tracksV2;
+      const items = (data?.items || [])
+        .filter((it) => it.item?.__typename === "TrackResponseWrapper" && it.item?.data)
+        .map((it) => toTrack(it.item.data));
+      const total = data?.totalCount || 0;
+      return { tracks: items, more: offset + items.length < total };
+    }
+    case "albums": {
+      const res = await gql("searchAlbums", "a71d2c993fc98e1c880093738a55a38b57e69cc4ce5a8c113e6c5920f9513ee2", {
+        searchTerm: query,
+        offset,
+        limit,
+        includePreReleases: false,
+        numberOfTopResults: 20,
+        includeAudiobooks: true,
+        includeAuthors: false,
+      });
+      const data = res?.data?.searchV2?.albumsV2;
+      const items = (data?.items || [])
+        .filter((it) => it.data)
+        .map((it) => toAlbum(it.data));
+      const total = data?.totalCount || 0;
+      return { albums: items, more: offset + items.length < total };
+    }
+    case "artists": {
+      const res = await gql("searchArtists", "0e6f9020a66fe15b93b3bb5c7e6484d1d8cb3775963996eaede72bac4d97e909", {
+        searchTerm: query,
+        offset,
+        limit,
+        includePreReleases: false,
+        numberOfTopResults: 20,
+        includeAudiobooks: true,
+        includeAuthors: false,
+      });
+      const data = res?.data?.searchV2?.artists;
+      const items = (data?.items || [])
+        .filter((it) => it.data)
+        .map((it) => toArtist(it.data));
+      const total = data?.totalCount || 0;
+      return { artists: items, more: offset + items.length < total };
+    }
+    case "playlists": {
+      const res = await gql("searchPlaylists", "fc3a690182167dbad20ac7a03f842b97be4e9737710600874cb903f30112ad58", {
+        searchTerm: query,
+        offset,
+        limit,
+        includePreReleases: false,
+        numberOfTopResults: 20,
+        includeAudiobooks: true,
+        includeAuthors: false,
+      });
+      const data = res?.data?.searchV2?.playlists;
+      const items = (data?.items || [])
+        .filter((it) => it.data)
+        .map((it) => toPlaylist(it.data));
+      const total = data?.totalCount || 0;
+      return { playlists: items, more: offset + items.length < total };
+    }
+    default:
+      return { [kind]: [], more: false };
+  }
+}
+
+// ============================================================================
+// Plugin Exports: Album, Artist, and Playlist Pages
+// ============================================================================
+
+export async function album({ id }) {
+  const uri = `spotify:album:${id}`;
+  const res = await gql("getAlbum", "b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10", {
+    uri,
+    locale: "",
+    offset: 0,
+    limit: 50,
+  });
+  const albumData = res?.data?.albumUnion;
+  if (!albumData) throw fail("unavailable", t("album not found"));
+  const a = toAlbum(albumData);
+  const trackItems = albumData.tracksV2?.items || [];
+  const tracks = trackItems.map((item) => toTrack(item.track, a));
+  return { album: a, tracks };
+}
+
+export async function artist({ id }) {
+  const uri = `spotify:artist:${id}`;
+  const res = await gql("queryArtistOverview", "7f86ff63e38c24973a2842b672abe44c910c1973978dc8a4a0cb648edef34527", {
+    uri,
+    locale: "",
+    preReleaseV2: false,
+  });
+  const artistData = res?.data?.artistUnion;
+  if (!artistData) throw fail("unavailable", t("artist not found"));
+  const art = toArtist(artistData);
+  const topTracks = (artistData.discography?.topTracks?.items || []).map((item) => toTrack(item.track));
+  const albums = (artistData.discography?.popularReleasesAlbums?.items || []).map(toAlbum);
+  return { artist: art, tracks: topTracks, albums };
+}
+
+export async function playlist({ id }) {
+  const uri = `spotify:playlist:${id}`;
+  const res = await gql("fetchPlaylist", "cd2275433b29f7316176e7b5b5e098ae7744724e1a52d63549c76636b3257749", {
+    uri,
+    offset: 0,
+    limit: 100,
+    enableWatchFeedEntrypoint: true,
+  });
+  const plData = res?.data?.playlistV2;
+  if (!plData) throw fail("unavailable", t("playlist not found"));
+  const items = plData.content?.items || [];
+  const tracks = items
+    .filter((item) => item.itemV2?.__typename === "TrackResponseWrapper" && item.itemV2?.data?.__typename === "Track")
+    .map((item) => toTrack(item.itemV2.data));
+  return toPlaylist(plData, tracks);
+}
+
+// ============================================================================
+// Plugin Exports: User Library (Playlists, Liked Songs, Saves)
+// ============================================================================
+
+export async function playlists() {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) return [];
+  const res = await gql("libraryV3", "390c78e5b951029bad359785e69b07b536a509c581cbcd0aded5e5067f187455", {
+    filters: ["Playlists"],
+    limit: 50,
+    offset: 0,
+    flatten: true,
+    expandedFolders: [],
+    folderUri: null,
+    includeFoldersWhenFlattening: true,
+  });
+  const items = res?.data?.me?.libraryV3?.items || [];
+  const out = [];
+  for (const libItem of items) {
+    if (libItem.item?.__typename === "PlaylistResponseWrapper" && libItem.item?.data) {
+      out.push(toPlaylist(libItem.item.data));
+    }
+  }
+  return out;
+}
+
+export async function liked({ offset = 0 }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const limit = 50;
+  const res = await gql("fetchLibraryTracks", "087278b20b743578a6262c2b0b4bcd20d879c503cc359a2285baf083ef944240", {
+    offset,
+    limit,
+  });
+  const lib = res?.data?.me?.library?.tracks;
+  if (!lib) return { tracks: [], more: false };
+  const items = lib.items || [];
+  const tracks = items.map((item) => toTrack(item.track?.data));
+  const total = lib.totalCount || 0;
+  return { tracks, more: offset + tracks.length < total };
+}
+
+export async function isLiked({ ids }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc || !ids.length) return Object.fromEntries(ids.map((id) => [id, false]));
+  const uris = ids.map((id) => `spotify:track:${id}`);
+  const res = await gql("isCurated", "e4ed1f91a2cc5415befedb85acf8671dc1a4bf3ca1a5b945a6386101a22e28a6", { uris });
+  const lookup = res?.data?.lookup || [];
+  const out = {};
+  ids.forEach((id, i) => {
+    out[id] = lookup[i]?.data?.isCurated || false;
+  });
+  return out;
+}
+
+export async function like({ id, on }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const uri = `spotify:track:${id}`;
+  if (on) {
+    await gql("addToLibrary", "a3c1ff58e6a36fec5fe1e3a193dc95d9071d96b9ba53c5ba9c1494fb1ee73915", {
+      uris: [uri],
+    });
+  } else {
+    await gql("applyCurations", "05b739a3a73091c213385233b9d3ed8a857c2ca29d2eebadb3d04ed12e288697", {
+      input: {
+        curations: [
+          {
+            contextUri: "spotify:collection:tracks",
+            curationType: "UNCURATE",
+          },
+        ],
+        itemUris: [uri],
+      },
+    });
+  }
+}
+
+export async function saveAlbum({ id, on }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const uri = `spotify:album:${id}`;
+  if (on) {
+    await gql("addToLibrary", "a3c1ff58e6a36fec5fe1e3a193dc95d9071d96b9ba53c5ba9c1494fb1ee73915", {
+      uris: [uri],
+    });
+  } else {
+    await gql("removeFromLibrary", "a3c1ff58e6a36fec5fe1e3a193dc95d9071d96b9ba53c5ba9c1494fb1ee73915", {
+      uris: [uri],
+    });
+  }
+}
+
+export async function followArtist({ id, on }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const uri = `spotify:artist:${id}`;
+  if (on) {
+    await gql("addToLibrary", "a3c1ff58e6a36fec5fe1e3a193dc95d9071d96b9ba53c5ba9c1494fb1ee73915", {
+      uris: [uri],
+    });
+  } else {
+    await gql("removeFromLibrary", "a3c1ff58e6a36fec5fe1e3a193dc95d9071d96b9ba53c5ba9c1494fb1ee73915", {
+      uris: [uri],
+    });
+  }
+}
+
+export async function savePlaylist({ id, on }) {
+  const spDc = host.storage.get("sp_dc");
+  if (!spDc) throw fail("signIn");
+  const uri = `spotify:playlist:${id}`;
+  if (on) {
+    await gql("addItemsToRootlist", "bd9c5cae1ee80ebca05d7ed12fd394216f49a20ce72d9dc762868df0f14522ea", {
+      uris: [uri],
+    });
+  } else {
+    await gql("removeItemsFromRootlist", "3422f1866532820a1d8d0560f88542dbdbd35d0377ee5ecd49593590f5f1e86b", {
+      uris: [uri],
+    });
+  }
+}
+
+// ============================================================================
+// Plugin Exports: Radio & Stations
+// ============================================================================
+
+const radioStation = {
+  id: "radio",
+  name: "Radio",
+  description: "Songs like the one you played last.",
+};
+
+export function stations() {
+  return [radioStation];
+}
+
+export function played({ id }) {
+  host.storage.set("lastPlayed", id);
+}
+
+export async function stationNext() {
+  let seed = host.storage.get("lastPlayed");
+  if (!seed) {
+    const h = await home();
+    seed = h.sections.flatMap((s) => s.tracks)[0]?.id;
+    if (!seed) return [];
+  }
+  const token = await getToken();
+  const url = `https://spclient.wg.spotify.com/inspiredby-mix/v2/seed_to_playlist/spotify:track:${seed}?response-format=json`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": webUA,
+    },
+  });
+  if (!res.ok) return [];
+  const data = await res.json();
+  const playlistUri = data.mediaItems?.[0]?.uri;
+  if (!playlistUri) return [];
+  const pl = await playlist({ id: playlistUri.replace(/^spotify:playlist:/, "") });
+  return (pl.tracks || []).filter((tr) => tr.id !== seed);
+}
+
+// ============================================================================
+// Plugin Exports: Lyrics
+// ============================================================================
+
+export async function lyrics({ id }) {
+  // 1. Try Spotify color-lyrics (if available)
+  const token = await getToken();
+  try {
+    const res = await fetch(
+      `https://spclient.wg.spotify.com/color-lyrics/v2/track/${id}?format=json&vType=web-player&market=from_token`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "User-Agent": webUA,
+          "App-Platform": "WebPlayer",
+        },
+      }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const lines = data.lyrics?.lines;
+      if (Array.isArray(lines) && lines.length) {
+        return {
+          lines: lines.map((l) => ({
+            start: Number(l.startTimeMs) || 0,
+            text: l.words || "",
+          })),
+        };
+      }
+    }
+  } catch (e) {
+    // ignore and fallback
+  }
+
+  // 2. Fallback to LRCLIB
+  try {
+    const tRes = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
+      uri: `spotify:track:${id}`,
+    });
+    const tData = tRes?.data?.trackUnion;
+    if (tData) {
+      const trackName = tData.name || "";
+      const artistName = tData.firstArtist?.items?.[0]?.profile?.name || "";
+      const durationSec = Math.round((tData.duration?.totalMilliseconds || 0) / 1000);
+      const lrcUrl = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${durationSec}`;
+      const lrcRes = await fetch(lrcUrl, {
+        headers: { "User-Agent": "MyGoMusic-Spotify/0.1.0" },
+      });
+      if (lrcRes.ok) {
+        const lrcData = await lrcRes.json();
+        return {
+          lrc: lrcData.syncedLyrics || lrcData.plainLyrics || "",
+        };
+      }
+    }
+  } catch (e) {
+    console.warn("lrclib fetch error:", e.message);
+  }
+
+  return { lrc: "" };
+}
+
+// ============================================================================
+// YouTube Audio Engine (Adapted from egoist/mygo-music-youtube-music)
+// ============================================================================
+
+const ytSite = "https://music.youtube.com";
+
+function clientVersion() {
+  const d = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  return `1.${d}.01.00`;
+}
+
+const remix = {
+  get client() {
+    return { clientName: "WEB_REMIX", clientVersion: clientVersion(), hl: host.language() === "zh-CN" ? "zh-CN" : "en" };
+  },
+};
+
+const visionOS = (visitor) => ({
+  client: {
+    clientName: "VISIONOS",
+    clientVersion: "1.02",
+    deviceMake: "Apple",
+    deviceModel: "RealityDevice17,1",
+    userAgent: visionUA,
+    osName: "visionOS",
+    osVersion: "26.5.23O471",
+    visitorData: visitor,
+  },
+  headers: {
+    "user-agent": visionUA,
+    "x-goog-visitor-id": visitor,
+    "x-youtube-client-name": "101",
+    "x-youtube-client-version": "1.02",
+  },
+  anonymous: true,
+});
+
+async function ytCall(endpoint, body, as = remix) {
+  const res = await fetch(`${ytSite}/youtubei/v1/${endpoint}?prettyPrint=false`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": webUA,
+      origin: ytSite,
+      "x-origin": ytSite,
+      ...as.headers,
+    },
+    body: JSON.stringify({ context: { client: as.client }, ...body }),
+  });
+  if (!res.ok) throw new Error(`YouTube ${endpoint}: ${res.status}`);
+  return res.json();
+}
+
+function findAll(node, name, out = []) {
+  if (Array.isArray(node)) {
+    for (const item of node) findAll(item, name, out);
+  } else if (node && typeof node === "object") {
+    for (const key of Object.keys(node)) {
+      if (key === name) out.push(node[key]);
+      else findAll(node[key], name, out);
+    }
+  }
+  return out;
+}
+
+const findOne = (node, name) => findAll(node, name)[0];
+
+const textOf = (nd) => (nd ? nd.simpleText || (nd.runs || []).map((r) => r.text).join("") : "");
+
+function msOf(text) {
+  if (!text || !/^\d+(:\d+)+$/.test(text)) return 0;
+  return text.split(":").reduce((sum, n) => sum * 60 + Number(n), 0) * 1000;
+}
+
+async function searchSongs(query) {
+  const filter = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+  const res = await ytCall("search", { query, params: decodeURIComponent(filter) });
+  const shelf = findOne(res, "musicShelfRenderer");
+  const items = shelf?.contents || [];
+  const tracks = [];
+  for (const item of items) {
+    const r = item.musicResponsiveListItemRenderer;
+    if (!r) continue;
+    const columns = (r.flexColumns || []).map((c) => c.musicResponsiveListItemFlexColumnRenderer?.text);
+    const title = textOf(columns[0]);
+    const nav = columns[0]?.runs?.[0]?.navigationEndpoint;
+    const videoId = r.playlistItemData?.videoId || nav?.watchEndpoint?.videoId;
+    const fixed = (r.fixedColumns || []).map((c) => textOf(c.musicResponsiveListItemFixedColumnRenderer?.text));
+    const runs = columns.slice(1).flatMap((c) => [...(c?.runs || []), { text: "•" }]);
+    let durationMs = msOf(fixed[0]);
+    if (!durationMs) {
+      for (const run of runs) {
+        const d = msOf(run.text);
+        if (d) {
+          durationMs = d;
+          break;
+        }
+      }
+    }
+    const author = textOf(columns[1]);
+    if (videoId) {
+      tracks.push({ videoId, title, author, durationMs });
+    }
+  }
+  return tracks;
+}
+
+function scoreCandidate(c, target) {
+  let score = 0;
+  const diffSec = c.durationMs > 0 && target.durationMs > 0 ? Math.abs(c.durationMs - target.durationMs) / 1000 : 999;
+  if (diffSec > 10) {
+    score -= 100 + diffSec;
+  } else {
+    score += (10 - diffSec) * 10;
+  }
+  const normTargetTitle = target.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const normCandTitle = c.title.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (normCandTitle === normTargetTitle) {
+    score += 60;
+  } else if (normCandTitle.includes(normTargetTitle) || normTargetTitle.includes(normCandTitle)) {
+    score += 30;
+  }
+  const normTargetArtist = target.artist.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const authorText = c.author.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (authorText.includes(normTargetArtist)) {
+    score += 40;
+  }
+  if (c.author.includes("Topic") || c.author.includes("•")) {
+    score += 15;
+  }
+  return { score, diffSec };
+}
+
+async function matchSpotifyTrack(id) {
+  const res = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
+    uri: `spotify:track:${id}`,
+  });
+  const tData = res?.data?.trackUnion;
+  if (!tData) throw fail("unavailable", t("track not found"));
+  const name = tData.name || "";
+  const artist = tData.firstArtist?.items?.[0]?.profile?.name || "";
+  const durationMs = tData.duration?.totalMilliseconds || 0;
+  const target = { id, name, artist, durationMs };
+
+  const query = `${name} ${artist}`.trim();
+  const candidates = await searchSongs(query);
+  if (!candidates.length) return null;
+
+  const scored = candidates.map((c) => ({
+    candidate: c,
+    ...scoreCandidate(c, target),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0];
+}
+
+async function getMatchedVideoId(id) {
+  const cacheKey = `yt:${id}`;
+  const cached = host.storage.get(cacheKey);
+  if (cached) return cached;
+  const match = await matchSpotifyTrack(id);
+  if (!match || !match.candidate?.videoId) {
+    throw fail("unavailable", t("could not find audio on YouTube"));
+  }
+  const videoId = match.candidate.videoId;
+  host.storage.set(cacheKey, videoId);
+  return videoId;
+}
+
+const installed = {};
+
+async function program(name, versionFlag) {
+  if (installed[name]) return installed[name];
+  const places = [name, `/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`];
+  for (const path of places) {
+    try {
+      const proc = host.spawn(path, [versionFlag]);
+      proc.closeStdin();
+      while ((await proc.readLine()) !== null) {}
+      if ((await proc.wait()) === 0) {
+        installed[name] = path;
+        return path;
+      }
+    } catch (e) {
+      if (/allowed/.test(e.message)) {
+        throw fail("setup", t("Allow Spotify to start programs in its settings"));
+      }
+    }
+  }
+  return null;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const located = new Map();
+const locatedFor = 60 * 60 * 1000;
+
+async function locate(id) {
+  const known = located.get(id);
+  if (known && Date.now() - known.at < locatedFor) return known;
+  let found;
+  try {
+    found = await direct(id);
+  } catch (e) {
+    if (e.code === "unavailable") throw e;
+    console.warn(`finding ${id}'s audio: ${e.message}`);
+    visitor = "";
+    found = await throughYtdlp(id, e);
+  }
+  found.at = Date.now();
+  located.set(id, found);
+  return found;
+}
+
+let visitor = "";
+
+async function visitorData() {
+  if (visitor) return visitor;
+  const r = await ytCall("visitor_id", {}, { ...remix, anonymous: true });
+  visitor = r.responseContext?.visitorData || "";
+  if (!visitor) throw new Error(t("YouTube gave this visit no ID"));
+  return visitor;
+}
+
+async function direct(id) {
+  const r = await ytCall("player", { videoId: id, contentCheckOk: true, racyCheckOk: true }, visionOS(await visitorData()));
+  const status = r.playabilityStatus || {};
+  if (status.status !== "OK") {
+    const why = status.reason || `YouTube says ${status.status || "nothing"} of this`;
+    throw status.status === "UNPLAYABLE" || status.status === "ERROR" ? fail("unavailable", why) : new Error(why);
+  }
+  let best = null;
+  for (const f of r.streamingData?.adaptiveFormats || []) {
+    if (!f.mimeType?.startsWith("audio/") || !f.url || f.isDrc) continue;
+    if (f.audioTrack && !f.audioTrack.audioIsDefault) continue;
+    if (!best || f.bitrate > best.bitrate) best = f;
+  }
+  if (!best) throw new Error(t("YouTube listed no audio to play as it is"));
+  return { url: best.url, http_headers: { "User-Agent": webUA }, gain: gainOf(r.playerConfig?.audioConfig), direct: true };
+}
+
+function gainOf(audio) {
+  const lkfs = audio?.trackAbsoluteLoudnessLkfs ?? audio?.perceptualLoudnessDb;
+  if (typeof lkfs !== "number" || !lkfs) return undefined;
+  return Math.round((-18 - lkfs) * 100) / 100;
+}
+
+const ytdlpTimeout = 25000;
+
+async function throughYtdlp(id, why) {
+  const ytdlp = await program("yt-dlp", "--version");
+  if (!ytdlp) throw why;
+  const args = [
+    "--config-locations",
+    "-",
+    "--no-warnings",
+    "--no-playlist",
+    "--no-progress",
+    "--extractor-args",
+    "youtube:skip=hls,dash",
+    "--format",
+    "bestaudio[protocol^=http]/bestaudio",
+    "--print",
+    "%(.{url,http_headers})j",
+  ];
+  for (const rt of ["deno", "node", "bun"]) {
+    const path = await program(rt, "--version");
+    if (path) {
+      args.push("--js-runtimes", `${rt}:${path}`);
+      break;
+    }
+  }
+  args.push(`https://www.youtube.com/watch?v=${id}`);
+
+  const proc = host.spawn(ytdlp, args);
+  proc.closeStdin();
+  const timer = setTimeout(() => proc.kill(), ytdlpTimeout);
+  const lines = [];
+  for (let line; (line = await proc.readLine()) !== null; ) lines.push(line);
+  const code = await proc.wait();
+  clearTimeout(timer);
+  if (code !== 0 || !lines.length) throw ytdlpFailure(proc.errorOutput());
+  return { ...JSON.parse(lines[lines.length - 1]), direct: false };
+}
+
+function ytdlpFailure(output) {
+  const said = output.split("\n").reverse().find((l) => l.startsWith("ERROR:")) || output.trim() || "yt-dlp stopped";
+  const why = said.replace(/^ERROR:\s*(\[[^\]]*\]\s*)?(\S+:\s*)?/, "");
+  if (/not a bot|sign in|cookies/i.test(why)) {
+    return fail("signIn", t("YouTube asks you to sign in to play this"));
+  }
+  if (/unavailable|private|removed|not available|premium/i.test(why)) return fail("unavailable", why);
+  return new Error(why);
+}
+
+let ranged = null;
+
+async function asksInPieces(ffmpeg) {
+  if (ranged !== null) return ranged;
+  const proc = host.spawn(ffmpeg, ["-hide_banner", "-h", "protocol=http"]);
+  proc.closeStdin();
+  let found = false;
+  for (let line; (line = await proc.readLine()) !== null; ) found ||= line.includes("-request_size");
+  await proc.wait();
+  return (ranged = found);
+}
+
+const serving = [];
+const servingAtMost = 3;
+const servedWithin = 10 * 60 * 1000;
+
+function stopWaiting() {
+  while (serving.length >= servingAtMost) serving.shift().kill();
+}
+
+async function serve(source, bitRate) {
+  const ffmpeg = await program("ffmpeg", "-version");
+  if (!ffmpeg) {
+    throw fail("setup", t("Spotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
+  }
+  const pieces = await asksInPieces(ffmpeg);
+  stopWaiting();
+  const headers = source.http_headers || {};
+  const port = 20000 + Math.floor(Math.random() * 40000);
+  const proc = host.spawn(ffmpeg, [
+    "-nostdin",
+    "-hide_banner",
+    "-nostats",
+    "-reconnect",
+    "1",
+    "-reconnect_streamed",
+    "1",
+    "-reconnect_delay_max",
+    "5",
+    "-rw_timeout",
+    "15000000",
+    ...(pieces ? ["-request_size", String(10 << 20)] : []),
+    ...(headers["User-Agent"] ? ["-user_agent", headers["User-Agent"]] : []),
+    "-i",
+    source.url,
+    "-vn",
+    "-c:a",
+    "libmp3lame",
+    "-b:a",
+    `${bitRate}k`,
+    "-id3v2_version",
+    "0",
+    "-write_xing",
+    "0",
+    "-f",
+    "mp3",
+    "-listen",
+    "1",
+    `http://127.0.0.1:${port}/`,
+  ]);
+  proc.closeStdin();
+  let stopped = false;
+  serving.push(proc);
+  const timer = setTimeout(() => proc.kill(), servedWithin);
+  proc.wait().then(() => {
+    stopped = true;
+    clearTimeout(timer);
+    const at = serving.indexOf(proc);
+    if (at >= 0) serving.splice(at, 1);
+  });
+
+  const until = Date.now() + 15000;
+  while (!proc.errorOutput().includes("Input #0")) {
+    if (stopped) throw new Error(`ffmpeg stopped: ${proc.errorOutput().trim().split("\n").pop()}`);
+    if (Date.now() > until) {
+      proc.kill();
+      throw new Error(t("the audio didn't start in time"));
+    }
+    await sleep(30);
+  }
+  await sleep(100);
+  return `http://127.0.0.1:${port}/`;
+}
+
+export async function stream({ id, quality }) {
+  const kbps = quality === "standard" ? 128 : 192;
+  const videoId = await getMatchedVideoId(id);
+  let source = await locate(videoId);
+  let url;
+  try {
+    url = await serve(source, kbps);
+  } catch (e) {
+    located.delete(videoId);
+    if (!source.direct || e.code === "setup") throw e;
+    console.warn(`playing ${videoId} as YouTube gave it: ${e.message}`);
+    source = { ...(await throughYtdlp(videoId, e)), gain: source.gain, at: Date.now() };
+    url = await serve(source, kbps);
+    located.set(videoId, source);
+  }
+  return {
+    url,
+    type: "mp3",
+    quality: kbps === 128 ? "standard" : "high",
+    bitRate: kbps * 1000,
+    gain: source.gain,
+  };
+}
