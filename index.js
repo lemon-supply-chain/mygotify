@@ -1,8 +1,8 @@
 /*
- * Spotify plugin for MyGo Music (Spotify catalog + YouTube audio)
+ * MyGotify: Spotify for MyGo Music, with audio from YouTube Music
  *
  * Copyright (C) 2026 Sonic Liberation (spotube-plugin-spotify)
- * Copyright (C) 2026 r0k1s_i
+ * Copyright (C) 2026 r0k1s-i
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as published by
