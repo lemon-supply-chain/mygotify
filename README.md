@@ -40,7 +40,7 @@ Spotify track metadata (title, artists, duration) is matched against YouTube Mus
 
 ## Lyrics
 
-From Spotify color-lyrics when available, with automatic fallback to [LRCLIB](https://lrclib.net/) by title, artist, and duration.
+From Spotify color-lyrics when available, with an automatic fallback chain: [LRCLIB](https://lrclib.net/) exact match, LRCLIB search, and [NetEase Cloud Music (网易云音乐)](https://music.163.com/) by title, artist, and duration.
 
 ## Credits and License
 

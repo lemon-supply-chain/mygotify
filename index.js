@@ -242,6 +242,7 @@ async function requestToken(spDc = "", bustNuance = false) {
   const data = await res.json();
   return {
     accessToken: data.accessToken,
+    clientId: data.clientId || "d8a5ed958d274c2e8ee717e6a4b0971d",
     expiresAt: data.accessTokenExpirationTimestampMs || Date.now() + 3600000,
     isAnonymous: Boolean(data.isAnonymous),
     spDc,
@@ -264,6 +265,56 @@ async function getToken() {
   tokenInfo = await requestToken(spDc);
   host.storage.set("token", tokenInfo);
   return tokenInfo.accessToken;
+}
+
+let clientTokenInfo = null;
+
+async function requestClientToken(clientId = "d8a5ed958d274c2e8ee717e6a4b0971d") {
+  const res = await fetch("https://clienttoken.spotify.com/v1/clienttoken", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "User-Agent": webUA,
+    },
+    body: JSON.stringify({
+      client_data: {
+        client_id: clientId,
+        client_version: "1.2.52.442.g0189348d",
+        js_sdk_data: {
+          device_brand: "Apple",
+          device_model: "unknown",
+          os: "Mac OS",
+          os_version: "10.15.7",
+        },
+      },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Spotify client token error: ${res.status}`);
+  }
+  const data = await res.json();
+  const token = data.granted_token?.token || "";
+  const expiresAfter = data.granted_token?.expires_after_seconds || 1200000;
+  return {
+    clientToken: token,
+    expiresAt: Date.now() + expiresAfter * 1000,
+  };
+}
+
+async function getClientToken(clientId) {
+  const now = Date.now();
+  if (clientTokenInfo && clientTokenInfo.expiresAt - now > 60000) {
+    return clientTokenInfo.clientToken;
+  }
+  const stored = host.storage.get("client_token");
+  if (stored && stored.expiresAt - now > 60000) {
+    clientTokenInfo = stored;
+    return clientTokenInfo.clientToken;
+  }
+  clientTokenInfo = await requestClientToken(clientId);
+  host.storage.set("client_token", clientTokenInfo);
+  return clientTokenInfo.clientToken;
 }
 
 // ============================================================================
@@ -483,7 +534,9 @@ export function signOut() {
   host.storage.remove("sp_dc");
   host.storage.remove("cookie");
   host.storage.remove("token");
+  host.storage.remove("client_token");
   tokenInfo = null;
+  clientTokenInfo = null;
 }
 
 export async function account() {
@@ -921,19 +974,101 @@ export async function stationNext() {
 // Plugin Exports: Lyrics
 // ============================================================================
 
+function normLyricText(text) {
+  if (!text) return "";
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function stripTitleNoise(title) {
+  return (title || "")
+    .replace(/\s*[\(\[](?:feat\.?|featuring|with|remaster\w*|\d{4}\s+remaster\w*|live|deluxe|version|ver\.|bonus|from\s+|唱片版|remix).*?[\)\]]/gi, "")
+    .replace(/\s*-\s*(?:\d{4}\s+)?(?:remaster\w*|live|deluxe|mono|single|version|ver\.|from\s+).*$/gi, "")
+    .trim();
+}
+
+function isCoverOrInstrumental(candTitle, targetTitle) {
+  const badWords = /(?:cover|翻唱|伴奏|纯音乐|piano|钢琴|instrumental|karaoke)/i;
+  return badWords.test(candTitle) && !badWords.test(targetTitle);
+}
+
+function scoreLyricCandidate(c, target) {
+  const diffSec = Math.abs(c.durationSec - target.durationSec);
+  if (diffSec > 3) return null;
+  if (isCoverOrInstrumental(c.title, target.name)) return null;
+
+  const normT = normLyricText(target.name);
+  const normCleanT = normLyricText(stripTitleNoise(target.name));
+  const normC = normLyricText(c.title);
+  const normCleanC = normLyricText(stripTitleNoise(c.title));
+
+  let titleScore = 0;
+  if (normC && normC === normT) {
+    titleScore = 60;
+  } else if (normCleanC && normCleanT && normCleanC === normCleanT) {
+    titleScore = 55;
+  } else if (normCleanC && normCleanT && (normCleanC.includes(normCleanT) || normCleanT.includes(normCleanC))) {
+    titleScore = 35;
+  }
+  if (titleScore === 0) return null;
+
+  const targetArtists = target.artists?.length ? target.artists : (target.artist ? [target.artist] : []);
+  const normCandAuthor = normLyricText(c.author);
+  let artistScore = 0;
+  for (const a of targetArtists) {
+    const normA = normLyricText(a);
+    if (!normA) continue;
+    if (normCandAuthor.includes(normA) || normA.includes(normCandAuthor)) {
+      artistScore = 40;
+      break;
+    }
+    const cjkChars = normA.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/gu);
+    if (cjkChars && cjkChars.length > 0) {
+      let matchedCount = 0;
+      for (const ch of cjkChars) {
+        if (normCandAuthor.includes(ch)) matchedCount++;
+      }
+      if (matchedCount >= Math.ceil(cjkChars.length / 2)) {
+        artistScore = 40;
+        break;
+      }
+    }
+  }
+
+  const isAsciiAuthorTarget = /^[a-z0-9\s]+$/i.test(target.artist || "");
+  const isAsciiAuthorCand = /^[a-z0-9\s]+$/i.test(c.author || "");
+  if (isAsciiAuthorTarget && isAsciiAuthorCand && !artistScore) {
+    return null;
+  }
+
+  const isCjkTarget = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(target.artist || "");
+  const isCjkCand = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(c.author || "");
+  if (isCjkTarget && isCjkCand && !artistScore) {
+    return null;
+  }
+
+  const durScore = (3 - diffSec) * 5;
+  const syncScore = c.hasSync ? 20 : 0;
+  return { score: titleScore + artistScore + durScore + syncScore, diffSec };
+}
+
 export async function lyrics({ id }) {
   // 1. Try Spotify color-lyrics (if available)
-  const token = await getToken();
   try {
+    const token = await getToken();
+    const clientId = tokenInfo?.clientId || "d8a5ed958d274c2e8ee717e6a4b0971d";
+    const clientToken = await getClientToken(clientId).catch(() => "");
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": webUA,
+      "App-Platform": "WebPlayer",
+      Accept: "application/json",
+    };
+    if (clientToken) {
+      headers["client-token"] = clientToken;
+    }
     const res = await fetch(
       `https://spclient.wg.spotify.com/color-lyrics/v2/track/${id}?format=json&vType=web-player&market=from_token`,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "User-Agent": webUA,
-          "App-Platform": "WebPlayer",
-        },
-      }
+      { headers }
     );
     if (res.ok) {
       const data = await res.json();
@@ -951,29 +1086,151 @@ export async function lyrics({ id }) {
     // ignore and fallback
   }
 
-  // 2. Fallback to LRCLIB
+  // Retrieve track metadata for fallback sources
+  let trackName = "";
+  let artistName = "";
+  let artists = [];
+  let durationSec = 0;
   try {
     const tRes = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
       uri: `spotify:track:${id}`,
     });
     const tData = tRes?.data?.trackUnion;
     if (tData) {
-      const trackName = tData.name || "";
-      const artistName = tData.firstArtist?.items?.[0]?.profile?.name || "";
-      const durationSec = Math.round((tData.duration?.totalMilliseconds || 0) / 1000);
-      const lrcUrl = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${durationSec}`;
-      const lrcRes = await fetch(lrcUrl, {
-        headers: { "User-Agent": "MyGoMusic-Spotify/0.1.0" },
-      });
-      if (lrcRes.ok) {
-        const lrcData = await lrcRes.json();
-        return {
-          lrc: lrcData.syncedLyrics || lrcData.plainLyrics || "",
-        };
+      trackName = tData.name || "";
+      artistName = tData.firstArtist?.items?.[0]?.profile?.name || "";
+      artists = [
+        ...(tData.firstArtist?.items || []),
+        ...(tData.otherArtists?.items || []),
+      ]
+        .map((a) => a?.profile?.name)
+        .filter(Boolean);
+      durationSec = Math.round((tData.duration?.totalMilliseconds || 0) / 1000);
+    }
+  } catch (e) {
+    console.warn("lyrics metadata error:", e.message);
+  }
+
+  if (!trackName) {
+    return { lrc: "" };
+  }
+
+  const target = { name: trackName, artist: artistName, artists, durationSec };
+
+  // 2. Fallback to LRCLIB /api/get (exact match)
+  try {
+    const lrcUrl = `https://lrclib.net/api/get?track_name=${encodeURIComponent(trackName)}&artist_name=${encodeURIComponent(artistName)}&duration=${durationSec}`;
+    const lrcRes = await fetch(lrcUrl, {
+      headers: { "User-Agent": "MyGoMusic-Spotify/0.1.0" },
+    });
+    if (lrcRes.ok) {
+      const lrcData = await lrcRes.json();
+      const lyric = lrcData.syncedLyrics || lrcData.plainLyrics;
+      if (lyric && lyric.trim()) {
+        return { lrc: lyric };
       }
     }
   } catch (e) {
-    console.warn("lrclib fetch error:", e.message);
+    console.warn("lrclib get error:", e.message);
+  }
+
+  // 3. Fallback to LRCLIB /api/search
+  try {
+    const query = `${trackName} ${artistName}`.trim();
+    const urlsToTry = [
+      `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
+    ];
+    if (trackName && trackName !== query) {
+      urlsToTry.push(`https://lrclib.net/api/search?q=${encodeURIComponent(trackName)}`);
+    }
+    for (const lrcSearchUrl of urlsToTry) {
+      const lrcSearchRes = await fetch(lrcSearchUrl, {
+        headers: { "User-Agent": "MyGoMusic-Spotify/0.1.0" },
+      });
+      if (lrcSearchRes.ok) {
+        const items = await lrcSearchRes.json();
+        if (Array.isArray(items) && items.length) {
+          const scored = [];
+          for (const it of items.slice(0, 10)) {
+            const lyric = it.syncedLyrics || it.plainLyrics;
+            if (!lyric || !lyric.trim()) continue;
+            const cand = {
+              title: it.trackName || it.name || "",
+              author: it.artistName || "",
+              durationSec: Math.round(Number(it.duration) || 0),
+              hasSync: Boolean(it.syncedLyrics && it.syncedLyrics.trim()),
+              lyric,
+            };
+            const match = scoreLyricCandidate(cand, target);
+            if (match) {
+              scored.push({ cand, score: match.score });
+            }
+          }
+          scored.sort((a, b) => b.score - a.score);
+          if (scored.length > 0) {
+            return { lrc: scored[0].cand.lyric };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("lrclib search error:", e.message);
+  }
+
+  // 4. Fallback to NetEase Cloud Music (网易云音乐)
+  try {
+    const query = `${trackName} ${artistName}`.trim();
+    const urlsToTry = [
+      `https://music.163.com/api/cloudsearch/pc?s=${encodeURIComponent(query)}&type=1&limit=10`,
+    ];
+    if (trackName && trackName !== query) {
+      urlsToTry.push(`https://music.163.com/api/cloudsearch/pc?s=${encodeURIComponent(trackName)}&type=1&limit=10`);
+    }
+    for (const neSearchUrl of urlsToTry) {
+      const neRes = await fetch(neSearchUrl, {
+        headers: { "User-Agent": webUA },
+      });
+      if (neRes.ok) {
+        const neData = await neRes.json();
+        const songs = neData?.result?.songs || [];
+        const scored = [];
+        for (const s of songs.slice(0, 10)) {
+          const cand = {
+            id: s.id,
+            title: s.name || "",
+            author: (s.ar || []).map((a) => a?.name).filter(Boolean).join(" / "),
+            durationSec: Math.round((s.dt || 0) / 1000),
+            hasSync: true,
+          };
+          const match = scoreLyricCandidate(cand, target);
+          if (match) {
+            scored.push({ cand, score: match.score });
+          }
+        }
+        scored.sort((a, b) => b.score - a.score);
+        for (const item of scored) {
+          const lyricUrl = `https://music.163.com/api/song/lyric?id=${item.cand.id}&lv=1&tv=-1`;
+          const lyrRes = await fetch(lyricUrl, {
+            headers: { "User-Agent": webUA },
+          });
+          if (lyrRes.ok) {
+            const lyrData = await lyrRes.json();
+            const lrc = lyrData?.lrc?.lyric;
+            if (lrc && typeof lrc === "string") {
+              const clean = lrc.trim();
+              if (clean && !clean.includes("纯音乐，请欣赏")) {
+                return { lrc: clean };
+              }
+            }
+          }
+        }
+        if (scored.length > 0) {
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("netease lyrics error:", e.message);
   }
 
   return { lrc: "" };
