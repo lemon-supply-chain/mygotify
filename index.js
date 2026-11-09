@@ -1576,12 +1576,16 @@ function msOf(text) {
 }
 
 async function searchSongs(query) {
+  // This is YouTube Music's Songs filter. Its structured rows come from the
+  // music catalog and expose artist/album metadata even when Spotify and YT
+  // display different scripts for the same artist.
   const filter = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
   const res = await ytCall("search", { query, params: decodeURIComponent(filter) });
   const shelf = findOne(res, "musicShelfRenderer");
   const items = shelf?.contents || [];
   const tracks = [];
-  for (const item of items) {
+  for (let rank = 0; rank < items.length; rank += 1) {
+    const item = items[rank];
     const r = item.musicResponsiveListItemRenderer;
     if (!r) continue;
     const columns = (r.flexColumns || []).map((c) => c.musicResponsiveListItemFlexColumnRenderer?.text);
@@ -1600,40 +1604,139 @@ async function searchSongs(query) {
         }
       }
     }
-    const author = textOf(columns[1]);
+    const author = columns[1]?.runs?.[0]?.text || textOf(columns[1]);
+    const fullSubtitle = textOf(columns[1]);
+    const metadata = columns.slice(1).flatMap((column) => column?.runs?.map((run) => run.text) || []).join(" ");
+    const viewCount = parseViewCount(metadata);
+    const badges = JSON.stringify(r.badges || []);
+    const officialBadge = /OFFICIAL_ARTIST_BADGE|Official Artist Channel/i.test(badges);
     if (videoId) {
-      tracks.push({ videoId, title, author, durationMs });
+      tracks.push({ videoId, title, author, durationMs, viewCount, officialBadge, rank,
+        topicOfficial: /\bTopic\b/i.test(fullSubtitle), catalogResult: true });
     }
   }
   return tracks;
 }
 
-function scoreCandidate(c, target) {
-  let score = 0;
-  const diffSec = c.durationMs > 0 && target.durationMs > 0 ? Math.abs(c.durationMs - target.durationMs) / 1000 : 999;
-  if (diffSec > 10) {
-    score -= 100 + diffSec;
-  } else {
-    score += (10 - diffSec) * 10;
-  }
-  const normTargetTitle = target.name.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const normCandTitle = c.title.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (normCandTitle === normTargetTitle) {
-    score += 60;
-  } else if (normCandTitle.includes(normTargetTitle) || normTargetTitle.includes(normCandTitle)) {
-    score += 30;
-  }
-  const normTargetArtist = target.artist.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const authorText = c.author.toLowerCase().replace(/[^a-z0-9]/g, "");
-  if (authorText.includes(normTargetArtist)) {
-    score += 40;
-  }
-  if (c.author.includes("Topic") || c.author.includes("•")) {
-    score += 15;
-  }
-  return { score, diffSec };
+async function searchYouTubeVideos(query) {
+  const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  const res = await fetch("https://www.youtube.com/youtubei/v1/search?prettyPrint=false", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "user-agent": webUA,
+      origin: "https://www.youtube.com",
+      "x-origin": "https://www.youtube.com",
+    },
+    body: JSON.stringify({
+      context: { client: { clientName: "WEB", clientVersion: `2.${date}.00.00`, hl: host.language() === "zh-CN" ? "zh-CN" : "en", gl: "JP" } },
+      query,
+    }),
+  });
+  if (!res.ok) throw new Error(`YouTube search: ${res.status}`);
+  const data = await res.json();
+  return findAll(data, "videoRenderer").map((video, rank) => ({
+    videoId: video.videoId,
+    rank,
+    title: textOf(video.title),
+    author: textOf(video.ownerText || video.longBylineText),
+    durationMs: msOf(textOf(video.lengthText)),
+    viewCount: parseViewCount(textOf(video.viewCountText)),
+    officialBadge: /OFFICIAL_ARTIST_BADGE|Official Artist Channel/i.test(JSON.stringify(video.ownerBadges || [])),
+    source: "youtube",
+    topicOfficial: /\bTopic\b/i.test(textOf(video.ownerText || video.longBylineText)),
+  })).filter((candidate) => candidate.videoId && candidate.title);
 }
 
+function parseViewCount(text) {
+  const match = (text || "").match(/([\d,.]+)\s*(K|M|B|千|万|億)\s*(?:views?|回視聴|次观看|次播放)?|([\d,]+)\s*(?:views?|回視聴|次观看|次播放)/i);
+  if (!match) return 0;
+  const value = Number((match[1] || match[3]).replace(/,/g, ""));
+  const multiplier = { k: 1e3, m: 1e6, b: 1e9, "千": 1e3, "万": 1e4, "億": 1e8 }[(match[2] || "").toLowerCase()] || 1;
+  return Number.isFinite(value) ? value * multiplier : 0;
+}
+
+function normalizeMatchText(value) {
+  return (value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+function normalizeMatchTitle(value, ...artistNames) {
+  let title = (value || "").normalize("NFKC").trim();
+  // Official uploads commonly prefix the artist, or append video/lyrics labels.
+  for (const artist of artistNames.filter(Boolean)) {
+    const escaped = artist.normalize("NFKC").trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (escaped) title = title.replace(new RegExp(`^${escaped}\\s*[-–—:：|｜]\\s*`, "i"), "");
+  }
+  title = title
+    .replace(/\s*[[(（【].*?(?:official|music video|mv|lyrics?|audio|visualizer|lyric video).*?[)\]）】]\s*/giu, " ")
+    .replace(/\b(?:official|music video|lyric video|lyrics?|audio|visualizer|高清|官方版)\b/giu, " ");
+  return normalizeMatchText(title);
+}
+
+function versionMarker(value) {
+  const text = (value || "").normalize("NFKC").toLocaleLowerCase();
+  const markers = [
+    ["piano", /\bpiano\b|ピアノ/u],
+    ["acoustic", /\bacoustic\b|アコースティック/u],
+    ["live", /\blive\b|ライブ/u],
+    ["cover", /\bcover\b|カバー/u],
+    ["karaoke", /\bkaraoke\b|カラオケ/u],
+    ["instrumental", /\binstrumental\b|インスト/u],
+    ["remix", /\bremix\b|リミックス/u],
+    ["sped-up", /\bsped[ -]?up\b/u],
+    ["slowed", /\bslowed\b/u],
+    ["nightcore", /\bnightcore\b/u],
+    ["first-take", /\bthe first take\b|\bfirst take\b/u],
+    ["live", /現場|现场|演唱會|演唱会|巡迴|巡回|live映像/u],
+    ["medley", /medley|串燒|串烧|組曲|组曲/u],
+    ["cover", /翻唱|翻奏|カバー/u],
+  ];
+  return markers.find(([, pattern]) => pattern.test(text))?.[0] || "";
+}
+
+function scoreCandidate(c, target) {
+  const normTargetTitle = normalizeMatchTitle(target.name, ...target.artists);
+  const normCandTitle = normalizeMatchTitle(c.title, ...target.artists, c.author);
+  const titleExact = Boolean(normTargetTitle && normCandTitle && normCandTitle === normTargetTitle);
+  const titleContains = Boolean(normTargetTitle && normCandTitle && normCandTitle.includes(normTargetTitle));
+  const targetArtistNames = target.artists.map(normalizeMatchText).filter(Boolean);
+  const channel = normalizeMatchText(c.author);
+  const artistMatch = targetArtistNames.some((name) => channel.includes(name));
+  const officialTopic = c.topicOfficial === true || /\s-\sTopic$/i.test((c.author || "").trim());
+  const officialSource = c.officialBadge === true || officialTopic || c.catalogResult === true;
+  const targetVersion = versionMarker(target.name);
+  const candidateVersion = versionMarker(c.title);
+  const versionMismatch = Boolean(candidateVersion && candidateVersion !== targetVersion);
+  const hasDuration = c.durationMs > 0 && target.durationMs > 0;
+  const diffSec = hasDuration ? Math.abs(c.durationMs - target.durationMs) / 1000 : 999;
+  const durationTolerance = target.durationMs > 0
+    ? Math.min(60, Math.max(20, target.durationMs / 1000 * 0.12))
+    : 0;
+  const durationClose = hasDuration && diffSec <= durationTolerance;
+  const durationUnknown = !hasDuration;
+  const titleLongEnoughForContains = normTargetTitle.length >= 5;
+  const bestArtistTitleRank = c.artistTitleSearchRank ?? 999;
+
+  // Search relevance helps choose between already plausible results. It is not
+  // proof that two different titles are language variants of the same song.
+  let score = c.officialBadge ? 220 : (officialTopic ? 190 : (c.catalogResult ? 140 : -1000));
+  if (artistMatch) score += 35;
+  if (titleExact) score += 150;
+  else if (titleContains) score += 50;
+  if (durationClose) score += Math.max(0, 35 - diffSec * 0.5);
+  if (bestArtistTitleRank < 999) score += Math.max(0, 24 - bestArtistTitleRank * 3);
+  if (c.viewCount > 0) score += Math.min(8, Math.log10(c.viewCount + 1));
+  if (versionMismatch) score -= 1000;
+
+  const exactMatch = titleExact && (durationClose || durationUnknown);
+  const safeContainsMatch = titleContains && titleLongEnoughForContains && durationClose &&
+    (artistMatch || bestArtistTitleRank <= 2);
+  const eligible = officialSource && !versionMismatch && (exactMatch || safeContainsMatch);
+  return { score, diffSec, titleExact, artistMatch, officialSource, versionMismatch, eligible };
+}
 async function matchSpotifyTrack(id) {
   const res = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
     uri: `spotify:track:${id}`,
@@ -1641,24 +1744,61 @@ async function matchSpotifyTrack(id) {
   const tData = res?.data?.trackUnion;
   if (!tData) throw fail("unavailable", t("track not found"));
   const name = tData.name || "";
-  const artist = tData.firstArtist?.items?.[0]?.profile?.name || "";
+  const artistItems = [
+    ...(tData.firstArtist?.items || []),
+    ...(tData.otherArtists?.items || []),
+  ];
+  const artists = [...new Set(artistItems.map((item) => item?.profile?.name).filter(Boolean))];
+  const artist = artists[0] || "";
   const durationMs = tData.duration?.totalMilliseconds || 0;
-  const target = { id, name, artist, durationMs };
+  const target = { id, name, artist, artists, durationMs };
 
-  const query = `${name} ${artist}`.trim();
-  const candidates = await searchSongs(query);
-  if (!candidates.length) return null;
-
-  const scored = candidates.map((c) => ({
-    candidate: c,
-    ...scoreCandidate(c, target),
-  }));
-  scored.sort((a, b) => b.score - a.score);
-  return scored[0];
+  const searchSpecs = [
+    { type: "music", query: `${name} ${artist}`.trim(), artistTitle: true },
+    { type: "music", query: name.trim(), artistTitle: false },
+    { type: "youtube", query: `${artist} ${name} official`.trim(), artistTitle: true },
+    { type: "youtube", query: `${name} ${artist}`.trim(), artistTitle: true },
+    { type: "youtube", query: name.trim(), artistTitle: false },
+  ].filter((item) => item.query);
+  const uniqueSpecs = [...new Map(searchSpecs.map((item) => [`${item.type}:${normalizeMatchText(item.query)}`, item])).values()];
+  const searches = uniqueSpecs.map((spec) => spec.type === "music"
+    ? searchSongs(spec.query)
+    : searchYouTubeVideos(spec.query));
+  const results = await Promise.allSettled(searches);
+  const candidateMap = new Map();
+  results.forEach((result, index) => {
+    if (result.status !== "fulfilled") {
+      console.warn("YouTube candidate search failed:", result.reason?.message || result.reason);
+      return;
+    }
+    const spec = uniqueSpecs[index];
+    for (const candidate of result.value) {
+      const existing = candidateMap.get(candidate.videoId);
+      if (existing) {
+        existing.catalogResult ||= candidate.catalogResult === true;
+        if (spec.artistTitle) existing.artistTitleSearchRank = Math.min(existing.artistTitleSearchRank ?? 999, candidate.rank ?? 999);
+        else existing.titleSearchRank = Math.min(existing.titleSearchRank ?? 999, candidate.rank ?? 999);
+        existing.officialBadge ||= candidate.officialBadge === true;
+        existing.topicOfficial ||= candidate.topicOfficial === true;
+        existing.viewCount = Math.max(existing.viewCount || 0, candidate.viewCount || 0);
+      } else {
+        candidateMap.set(candidate.videoId, {
+          ...candidate,
+          artistTitleSearchRank: spec.artistTitle ? (candidate.rank ?? 999) : 999,
+          titleSearchRank: spec.artistTitle ? 999 : (candidate.rank ?? 999),
+          queryEvidence: [spec.query],
+        });
+      }
+    }
+  });
+  const scored = [...candidateMap.values()]
+    .map((candidate) => ({ candidate, ...scoreCandidate(candidate, target) }))
+    .filter((item) => item.eligible)
+    .sort((a, b) => b.score - a.score);
+  return scored[0] || null;
 }
-
 async function getMatchedVideoId(id) {
-  const cacheKey = `yt:${id}`;
+  const cacheKey = `yt:v23:${id}`;
   const cached = host.storage.get(cacheKey);
   if (cached) return cached;
   const match = await matchSpotifyTrack(id);
@@ -1705,7 +1845,7 @@ async function locate(id) {
   try {
     found = await direct(id);
   } catch (e) {
-    if (e.code === "unavailable") throw e;
+    // VisionOS can reject videos that yt-dlp can still play.
     console.warn(`finding ${id}'s audio: ${e.message}`);
     visitor = "";
     found = await throughYtdlp(id, e);
